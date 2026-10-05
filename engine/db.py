@@ -83,9 +83,16 @@ CREATE TABLE trades(
   status TEXT NOT NULL CHECK (status IN ('pending','accepted','declined','failed')),
   created INT NOT NULL, resolved INT);
 
+-- cmd payload = JSON {"text", "actions"}: the DECIDED actions, so replay never re-asks a model
 CREATE TABLE inputs(
   id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL CHECK (kind IN ('cmd','advance')),
   actor_id TEXT, payload TEXT NOT NULL);
+
+-- cost telemetry (BRIEF §17): one row per model call, never read by rules
+CREATE TABLE model_calls(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, time INT NOT NULL, actor_id TEXT, purpose TEXT NOT NULL,
+  model TEXT NOT NULL, input_tokens INT, output_tokens INT, cache_read_input_tokens INT, latency_ms INT,
+  verbs TEXT NOT NULL DEFAULT '[]');
 
 -- evidence: one row per witness (perception) and per physical trace of every crime event
 CREATE VIEW evidence AS

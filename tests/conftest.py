@@ -6,6 +6,8 @@ from engine.engine import Engine
 
 
 def new(seed=42, **cfg):
+    """M1 rule tests drive the engine directly, so confirmations are off unless a test turns them on."""
+    cfg.setdefault("confirm_irreversible", False)
     return Engine.create(seed=seed, config=Config(**cfg))
 
 

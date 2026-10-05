@@ -161,6 +161,13 @@ def log_input(conn, kind, actor_id, payload):
     _w(conn, "INSERT INTO inputs (kind, actor_id, payload) VALUES (?, ?, ?)", kind, actor_id, payload)
 
 
+def log_model_call(conn, actor_id, purpose, usage, verbs):
+    _w(conn, "INSERT INTO model_calls (time, actor_id, purpose, model, input_tokens, output_tokens, "
+             "cache_read_input_tokens, latency_ms, verbs) VALUES (?,?,?,?,?,?,?,?,?)",
+       now(conn), actor_id, purpose, usage.get("model", "?"), usage.get("input_tokens"), usage.get("output_tokens"),
+       usage.get("cache_read_input_tokens"), usage.get("latency_ms"), verbs)
+
+
 def advance_clock(conn, ticks):
     _w(conn, "UPDATE meta SET value = CAST(value AS INT) + ? WHERE key='clock'", ticks)
 

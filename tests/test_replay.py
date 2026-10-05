@@ -18,7 +18,7 @@ SESSION = [
 
 
 def test_replay_reproduces_events_and_dice():
-    cfg = Config()
+    cfg = Config(confirm_irreversible=False)
     eng = Engine.create(seed=99, config=cfg, world=fixtures.MILL_STREET)
     for i, (actor, text) in enumerate(SESSION):
         eng.submit(actor, text)

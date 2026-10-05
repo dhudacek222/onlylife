@@ -9,8 +9,9 @@
 | Concurrency model | **One authoritative writer per world.** Every action runs in one `BEGIN IMMEDIATE` transaction | 150 entities/world is tiny; serialising actions removes whole classes of dupe/race bugs |
 | Server (M5) | FastAPI + websockets, one world process | not in M1 |
 | AI (M2+) | `typing.Protocol` interfaces: `DecisionModel`, `Narrator`, `Storyteller`, `ImageGen` | swappable, never touch DB |
+| LLM adapter (M2) | official `anthropic` SDK, **optional**, imported lazily inside `harness/claude.py` only | stdlib core stays dependency-free; SDK gives retries/typed errors |
 | Tests | pytest | installed |
-| Dependencies in M1 | **none** beyond stdlib + pytest | |
+| Dependencies | **none** beyond stdlib + pytest for engine, rules model and tests; `anthropic` only to run with `--claude` | |
 
 ## 2. Module boundaries
 
@@ -20,17 +21,24 @@ engine/
   db.py        SCHEMA (DDL + integrity triggers), connect()
   dice.py      Dice: seeded, counter-based, every roll logged; probability helpers
   actions.py   Verb metadata (irreversible? hostile? crime?), Action, Roll, Result dataclasses
-  parser.py    M1 hardcoded parser: text -> list[Action]  (replaced by DecisionModel in M2)
+  parser.py    hardcoded parser: text -> list[Action]  (wrapped by harness.rules_model in M2)
   world.py     ONLY module that writes world tables. Read queries + the consequence WHITELIST
   rules.py     Deterministic resolution per verb: prerequisites, DCs, modifiers, dice -> whitelist calls
-  engine.py    Engine facade: submit/advance/view/replay, transaction per action, template text per observer
+  engine.py    Engine facade: the harness loop (submit), preview/confirm, alternatives, per-observer facts, replay
   fixtures.py  Demo world ("Mill Street") used by tests and the REPL
-  __main__.py  Tiny REPL: python -m engine
+  __main__.py  Tiny REPL: python -m engine [--claude]
+harness/       AI seams (M2). May import engine.actions / engine.parser / engine.config only
+  protocols.py   DecisionModel, Narrator Protocols; Decision record
+  rules_model.py RulesDecisionModel: parser + fillers/slang/typos, view-based ref check, injection screen, confidence
+  claude.py      ClaudeDecisionModel, ClaudeNarrator, EscalatingModel; validate() for untrusted model output
+  narration.py   TemplateNarrator (the M1 templates, now fed per-observer facts)
+  eval.py        parser eval: accuracy per category + calibration; evalset.jsonl (139 cases)
 tests/
 ```
 
-Dependency direction (no cycles): `engine → rules → world → db`; `rules → dice, actions, config`; `parser → actions`.
-**No AI module may import `world`.** M2's harness hands structured `Action`s to `engine`, exactly like the hardcoded parser does.
+Dependency direction (no cycles): `engine → rules → world → db`; `rules → dice, actions, config`; `parser → actions`;
+`engine.engine → harness → engine.actions/parser`. **No AI module may import `world`, `db` or `rules`** (test-enforced).
+The harness hands structured `Action`s to the engine; the engine never trusts them beyond the verb whitelist.
 
 ## 3. Pipeline (M1 subset of the Action Harness)
 
@@ -88,7 +96,8 @@ JSON columns are `TEXT` holding JSON. All ids are TEXT slugs (`"bob"`, `"knife_1
 - `knowledge(id PK AUTOINC, observer_id, subject_id, fact ['aware_of','seen_at','knows_identity','knows_crime'], location_id NULL, time, event_id NULL)` — append-only. Visibility rule: observer sees subject iff `subject.hidden=0` OR an `aware_of` row exists with `time >= subject.hidden_since`.
 - `dice_log(id PK = roll counter, time, event_id NULL, actor_id, purpose, sides, raw JSON (both dice if adv/dis), mode ['normal','advantage','disadvantage'], modifier, total, dc NULL, success NULL)` — append-only.
 - `trades(id PK AUTOINC, from_id, to_id, give_items JSON, give_coins, want_items JSON, want_coins, status ['pending','accepted','declined','failed'], created, resolved NULL)`
-- `inputs(id PK AUTOINC, kind ['cmd','advance'], actor_id NULL, payload TEXT)` — everything needed for replay.
+- `inputs(id PK AUTOINC, kind ['cmd','advance'], actor_id NULL, payload TEXT)` — everything needed for replay. Since M2 a `cmd` payload is JSON `{"text", "actions"}` (the decided actions).
+- `model_calls(id, time, actor_id, purpose ['decide','narrate'], model, input_tokens, output_tokens, cache_read_input_tokens, latency_ms, verbs JSON)` — cost telemetry; never read by rules.
 
 ## 6. Rules (M1)
 
@@ -136,10 +145,72 @@ Verbs (all resolve against the actor's current location):
 ## 8. Engine API
 
 ```python
-eng = Engine.create(path=":memory:", seed=42, config=Config(), world=fixtures.MILL_STREET)
-results = eng.submit("player", "take knife and attack bob")   # list[Result]
+eng = Engine.create(path=":memory:", seed=42, config=Config(), world=fixtures.MILL_STREET,
+                    model=None, narrator=None)       # defaults: RulesDecisionModel, TemplateNarrator
+results = eng.submit("player", "take knife and attack bob")   # -> [Result(outcome="confirm", alternatives=[Yes, Cancel])]
+results = eng.submit("player", "take knife and attack bob", confirm=True)   # executes
 eng.advance(60)                     # moves global clock, logged in inputs
 eng.view("player")                  # dict: what this observer can see right now
 eng2 = Engine.replay(fixture, seed, config, eng.inputs())   # identical events + dice_log
 ```
-`Result(action, outcome ['success','failure','impossible','ambiguous','unparsed','skipped'], reason, missing, candidates, rolls: list[Roll], event_id, messages: dict[observer_id, str])` — `rolls` + `reason` make every failure legible (brief §2.9).
+`Result(action, outcome ['success','failure','impossible','ambiguous','unparsed','skipped','refused','confirm','clarify'], reason, missing, candidates, rolls: list[Roll], event_id, messages: dict[observer_id, str], alternatives: list[{label, command, confirm?}])` — `rolls` + `reason` make every failure legible (brief §2.9).
+
+## 9. Milestone 2 — the Action Harness (BRIEF §5)
+
+```
+submit(actor, text, confirm=False, via="text"|"button")
+  d = model.decide(text, view(actor))            # view = per-observer, so models never see hidden entities
+  d.usage            → model_calls row (cost per action type, BRIEF §17)
+  d.injection        → "refused"   (nothing written, no turn used)
+  no actions         → "unparsed"  + suggestion buttons (nothing written)
+  confidence < escalate_below (irreversible) or < clarify_below (any) → "clarify": "Did you mean: <canonical>?"
+  irreversible and not confirm → preview: run the chain inside a transaction up to the first irreversible action,
+       probe its first roll (rules.Probe), ROLLBACK everything → "confirm" + risk estimate + [Yes, Cancel] buttons,
+       or the impossible/ambiguous Result + alternatives (still nothing written)
+  else → execute (one transaction, M1 semantics) and narrate each detecting observer from facts(observer, event)
+```
+- **Buttons carry canonical commands** (`actions.to_command`), which the hardcoded parser maps back exactly (test-enforced
+  round trip). Confirming never re-asks an LLM and needs no server-side pending state.
+- **Preview burns nothing:** dice counter, clock, events all roll back; the confirmed roll is identical to an unconfirmed one.
+- **Replay stores decisions, not text:** `inputs.payload` for `cmd` = `{"text", "actions"}`. `Engine.replay` executes the
+  logged actions without any model, so an LLM in the loop cannot break determinism.
+- **Model output is untrusted:** `claude.validate` enforces verb whitelist, field types, string/coin/length caps;
+  anything off → treated as not understood. Safety against injection comes from the whitelist + rules prerequisites;
+  detection only saves tokens and gives a clear message. Speech text (`say`/`talk`) is exempt from detection.
+- **Escalation:** rules model first (free, deterministic); LLM only below `escalate_below`; rule-detected injection is
+  final; an LLM failure or a less confident LLM answer keeps the rules' decision.
+- **Narration:** `Engine.facts(observer, result)` is the only narrator input: labels as that observer knows them
+  ("a stranger in a green cloak"), no ids, rolls/reason/scene only for the actor, nothing for non-detecting observers.
+  Buttons always get templates; free text uses the configured narrator (ClaudeNarrator falls back to templates).
+- **Alternatives** (`Engine._alternatives`) come from the actor's view: locked door → unlock/force; no lockpick →
+  take the one lying here/force; named weapon missing → take it/attack unarmed; ambiguity → one button per candidate;
+  always "look around" + Cancel.
+- **Rules-model confidence levels:** exact parse 1.0; known rewrite (filler words, slang table, trailing "please") 0.9;
+  unknown-but-suspicious reference (mistyped connector "wiht", transposed name "bbo") 0.7; fuzzy verb or reference
+  correction 0.6; not understood 0.0. Calibrated on `harness/evalset.jsonl`: every case at ≥0.8 is correct (test-enforced).
+
+### New tunables (Config)
+| Name | Default | Note |
+|---|---|---|
+| `confirm_irreversible` | True | M1 rule tests turn it off; NPC routines (M3) will too |
+| `escalate_below` | 0.8 | LLM escalation + clarify threshold for irreversible actions |
+| `clarify_below` | 0.65 | below this even reversible guesses are offered, not run |
+| `risk_xp_steps` | (100, 1000) | verbal_scaled: xp < 100 → poor/even/good; < 1000 → 5 words; else "roughly N in 10" |
+| `llm_model` / `llm_effort` | `claude-opus-5-5` / `low` | **OPEN DECISION 16**: Opus is the quality default; the brief's ≈$0.10/player-hour target likely needs a cheaper model for decide/narrate — measure with `python -m harness.eval --claude` and the `model_calls` table before switching |
+
+Requests to Claude use structured outputs (`output_config.format` json_schema; forced `tool_choice` is rejected by
+current models), a cached system prompt, and server-side refusal fallback (`fallbacks: "default"`). A refused or
+truncated response is treated as not understood.
+
+## 10. Part 2 brief (`BRIEF_PART2.md`): contradictions and proposed resolutions
+
+| # | Conflict | Proposed resolution (not yet built) |
+|---|---|---|
+| 1 | P2 §1 "traveller appears on the world map along the route" vs P1 §9 "never live tracking" | map shows your own position and caravans you know of; everyone else only via fading "last seen" circles |
+| 2 | P2 §2.2 offline agent keeps your character trading vs P1 §10/§11 offline = out of the world | new status `agent` (perceives + trades inside a safe zone, protected from crimes like offline chars); decide if shops can be robbed while owner is an agent |
+| 3 | P2 §1 caravan journeys continue offline vs P1 §11 logout only in safe places | explicit exception: an escorted caravan counts as a safe location |
+| 4 | P2 §11 step 5 (playable first street with juice/dice animation) precedes step 6 (web client shell) and the server was planned for M5 | a minimal server + client must exist at step 5; move FastAPI/WebSocket from M5 to step 5 |
+| 5 | P1 OPEN DECISION 7 (fresh "look around" image costs half a turn) assumes generated images; live 3D always shows the scene | drop it; the renderer may only draw `view()` (per-observer) and the half-turn cost stays on the perception roll |
+| 6 | P2 §8 generator input needs footprint, windows per side, cosmetic tags; schema has a tier with a window count only, and the tavern has no building record | extend `buildings`/`housing_tiers` (footprint, per-side windows, tags) and give every building a record; windows become entities (peeking, P2 §10) |
+| 7 | P2 §5 "client only renders state pushed by server" — a full scene graph would leak hidden entities over the WebSocket | server pushes per-observer view diffs only; never the location's full state |
+| 8 | P2 §2.1 "never wait-or-pay timers" vs 15–30 real-minute walks | travel must roll route events (content), and travel time is a config value |

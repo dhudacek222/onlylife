@@ -9,6 +9,14 @@ ARTICLES = {"the", "a", "an", "my", "your", "his", "her", "their", "some"}
 COINS = {"coins", "coin", "money", "gold", "purse"}
 
 
+class Probe(Exception):
+    """Raised by Ctx.roll in preview mode: the first check an action would make, before it is rolled."""
+
+    def __init__(self, purpose, modifier, dc, mode):
+        super().__init__(purpose)
+        self.purpose, self.modifier, self.dc, self.mode = purpose, modifier, dc, mode
+
+
 class Impossible(Exception):
     def __init__(self, reason, missing=(), outcome="impossible", candidates=()):
         super().__init__(reason)
@@ -40,8 +48,8 @@ def is_night(cfg, t):
 class Ctx:
     """One action in flight: actor snapshot, the reserved event id, and the rolls made so far."""
 
-    def __init__(self, conn, cfg, actor_id, action):
-        self.conn, self.cfg, self.a = conn, cfg, action
+    def __init__(self, conn, cfg, actor_id, action, probe=False):
+        self.conn, self.cfg, self.a, self.probe = conn, cfg, action, probe
         self.me = world.char(conn, actor_id)
         self.now = world.now(conn)
         self.eid = world.next_event_id(conn)
@@ -52,6 +60,8 @@ class Ctx:
         return self.me["location_id"]
 
     def roll(self, purpose, modifier, dc=None, mode="normal", sides=20):
+        if self.probe:
+            raise Probe(purpose, modifier, dc, mode)
         r = world.roll(self.conn, self.me["id"], purpose, modifier, dc, mode, sides, self.eid, self.now)
         self.rolls.append(r)
         return r
@@ -598,20 +608,28 @@ HANDLERS = {
 }
 
 
-def resolve(conn, cfg, actor_id, action):
+def resolve(conn, cfg, actor_id, action, probe=False):
     """Resolve one action inside the caller's transaction. Impossible/ambiguous roll back to a savepoint,
-    so they can never leave a write behind; any other exception propagates to the caller's rollback."""
+    so they can never leave a write behind; any other exception propagates to the caller's rollback.
+    probe=True: check prerequisites, then stop at the first roll and return the Probe (or the Result if the
+    action needs no roll); nothing is kept either way."""
     conn.execute("SAVEPOINT action")
     try:
-        c = Ctx(conn, cfg, actor_id, action)
+        c = Ctx(conn, cfg, actor_id, action, probe)
         if c.me is None:
             raise Impossible(f"There is no character '{actor_id}'.")
         if c.me["status"] == "dead":
             raise Impossible("You are dead.")
         res = HANDLERS[action.verb](c, action)
+    except Probe as p:
+        conn.execute("ROLLBACK TO action")
+        conn.execute("RELEASE action")
+        return p
     except Impossible as e:
         conn.execute("ROLLBACK TO action")
         conn.execute("RELEASE action")
         return Result(action, e.outcome, e.reason, e.missing, e.candidates)
+    if probe:
+        conn.execute("ROLLBACK TO action")
     conn.execute("RELEASE action")
     return res

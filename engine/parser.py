@@ -68,7 +68,7 @@ def _clause(clause):
         a.target, a.text = who.lower().strip(), text.strip().strip('"')
         return a
     if verb in ("move", "flee"):
-        a.target = re.sub(r"^(to|into|in|towards?)\s+", "", r) or None
+        a.target = re.sub(r"^(to|too|into|in|towards?)\s+", "", r) or None
     elif verb in ("take", "drop", "use"):
         a.item = re.split(r"\s+from\s+", r)[0] or None
     elif verb == "give":
