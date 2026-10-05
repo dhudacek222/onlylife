@@ -3,6 +3,7 @@
 Read these before working:
 - `BRIEF.md` + `BRIEF_PART2.md` (world, client, visuals; Part 2 wins on conflicts) — the product brief and its non-negotiable principles (engine = source of truth, AI never mutates state, whitelist consequences, nothing vanishes, every action leaves evidence, per-observer information, legible fairness).
 - `DESIGN.md` — binding contract: stack, module boundaries, DB schema, rules table, OPEN DECISIONS (all live in `engine/config.py`), Engine API.
+- `RESEARCH.md` — why AI RPGs feel soft and the design rules that prevent it (code decides, LLM voices).
 - `STATUS.md` — what is done, what is in progress, what is next. **Update it at the end of every session.**
 
 ## Commands
