@@ -24,6 +24,8 @@ engine/
   parser.py    hardcoded parser: text -> list[Action]  (wrapped by harness.rules_model in M2)
   world.py     ONLY module that writes world tables. Read queries + the consequence WHITELIST
   rules.py     Deterministic resolution per verb: prerequisites, DCs, modifiers, dice -> whitelist calls
+  encounters.py  Encounter lifecycle (start, join, turn order, leave, end) via world.* writes
+  npc.py       Deterministic NPC fight routine: picks an Action, rules resolve it
   engine.py    Engine facade: the harness loop (submit), preview/confirm, alternatives, per-observer facts, replay
   fixtures.py  Demo world ("Mill Street") used by tests and the REPL
   __main__.py  Tiny REPL: python -m engine [--claude]
@@ -214,3 +216,27 @@ truncated response is treated as not understood.
 | 6 | P2 §8 generator input needs footprint, windows per side, cosmetic tags; schema has a tier with a window count only, and the tavern has no building record | extend `buildings`/`housing_tiers` (footprint, per-side windows, tags) and give every building a record; windows become entities (peeking, P2 §10) |
 | 7 | P2 §5 "client only renders state pushed by server" — a full scene graph would leak hidden entities over the WebSocket | server pushes per-observer view diffs only; never the location's full state |
 | 8 | P2 §2.1 "never wait-or-pay timers" vs 15–30 real-minute walks | travel must roll route events (content), and travel time is a config value |
+
+## 11. Encounters (BRIEF §7) — first slice of build step 5
+
+- **Start:** an `attack`, or a `steal` the victim notices (failure), on a character outside any encounter creates
+  `encounters` + two `encounter_members` rows. Each member rolls initiative = d20 + dex mod (logged, purpose
+  `initiative`). The opening act happened before turn order; the turn then goes to the top of the order.
+- **Join by involvement, not proximity (interpretation, owner may overrule):** whoever acts hostile toward a member,
+  or is targeted by one, joins with `joined_round = round + 1`. Bystanders and arrivals stay free, so nobody can
+  freeze a room by starting a fight. BRIEF §7's "anyone entering the radius joins" is read as "may join by acting".
+- **Order:** `joined_round`, then initiative (high first), then id. Earlier members always act before newcomers.
+- **Turn gate (rules.turn_gate, applies to previews too):** a member acts only on their turn; `say`/`talk` are free and
+  don't pass the turn; `move` is refused ("flee" alternatives offered); `flee` is the way out (dex check).
+- **Leave / end:** dead, offline or no longer at the location → `left_round` set. Fewer than two active members →
+  `ended`. If the turn holder leaves, the turn passes on in the order as it stood.
+- **Timeout:** `Engine.timeout(encounter_id)`, called by the server when `turn_timer_seconds` runs out: the turn
+  holder `wait`s. Logged as an ordinary `cmd` input, so replay needs no wall clock.
+- **NPC turns:** after every submit/timeout the engine plays each NPC whose turn it is (`engine/npc.py`): non-guards
+  flee at ≤ `npc_flee_below` × max hp, otherwise hit back at their latest attacker; guards attack the most wanted
+  member. A choice the rules reject (e.g. the attacker is hidden from it) becomes `wait`. NPC actions are logged
+  inputs; replay executes them and never re-runs the policy.
+- **Per-observer:** `view()["encounter"]` lists only members the observer can see; a hidden turn holder is "someone".
+- `Config.encounters` (default True) is switched off only by the M1 single-action rule tests.
+- Not yet: free attack on a failed flee (BRIEF says "may"), guards joining fights they witness (needs NPC routines),
+  per-turn real-time timer (server, step 5).

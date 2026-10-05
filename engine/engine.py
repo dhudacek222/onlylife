@@ -4,7 +4,7 @@ per input. Narration is built per observer from that observer's perception row o
 import json
 from contextlib import contextmanager
 
-from engine import db, fixtures, rules
+from engine import db, encounters, fixtures, npc, rules
 from engine import world as W
 from engine.actions import VERBS, Action, Result, to_command
 from engine.config import Config
@@ -86,7 +86,30 @@ class Engine:
                 return [stop]
             stop.alternatives = [{"label": f"Yes: {command}", "command": command, "confirm": True}, CANCEL]
             return [stop]
-        return self._execute(actor_id, text, d.actions, template=via == "button")
+        return self._execute(actor_id, text, d.actions, template=via == "button") + self._npc_turns()
+
+    def timeout(self, encounter_id):
+        """The server calls this when the turn timer (Config.turn_timer_seconds) runs out: the member whose turn it
+        is takes the default action. Logged like any command, so replay needs no clock."""
+        enc = W.encounter(self.conn, encounter_id)
+        if enc is None or enc["ended"] is not None or enc["turn_id"] is None:
+            return []
+        return self._execute(enc["turn_id"], "(timeout)", [Action("wait")]) + self._npc_turns()
+
+    def _npc_turns(self):
+        """Play every NPC whose turn it is, until a human is up (or nobody is fighting)."""
+        results = []
+        for _ in range(200):  # ponytail: hard stop against NPC-only fights that never end; M3 routines replace it
+            enc = next((e for e in W.active_encounters(self.conn)
+                        if e["turn_id"] and W.char(self.conn, e["turn_id"])["is_npc"]), None)
+            if enc is None:
+                break
+            nid = enc["turn_id"]
+            rs = self._execute(nid, "(npc)", [npc.choose(self.conn, self.config, nid, enc)])
+            if not rs[0].event_id:  # e.g. its attacker is hidden from it: it holds its ground
+                rs = self._execute(nid, "(npc)", [Action("wait")])
+            results += rs
+        return results
 
     def _preview(self, actor_id, actions):
         """Dry-run the chain up to its first irreversible action, then roll everything back. Returns that action's
@@ -146,6 +169,8 @@ class Engine:
                 if "key" in types or "lockpick" in types:
                     out.append(f"unlock {door}")
                 out.append(f"force {door}")
+            elif m == "flee":  # in a fight, walking away isn't an option
+                out += [f"flee to {e['name']}" for e in v["exits"]]
             elif m == "lockpick":
                 out += [f"take {i['name']}" for i in v["items"] if i["type"] == "lockpick"]
                 if action.target:
@@ -171,6 +196,8 @@ class Engine:
                     results.append(Result(a, "skipped", "An earlier action in this command didn't succeed."))
                     continue
                 r = rules.resolve(self.conn, self.config, actor_id, a)
+                if r.event_id and self.config.encounters:
+                    encounters.after_action(self.conn, actor_id, a.verb, r.event_id)
                 if r.event_id:
                     r.messages = {}
                     for o in W.detectors(self.conn, r.event_id):
@@ -255,7 +282,19 @@ class Engine:
                            if c["id"] != observer_id and W.can_see(conn, observer_id, c)],
             "items": [thing(i) for i in W.items_at(conn, here)],
             "inventory": [thing(i) for i in W.items_held(conn, observer_id)],
+            "encounter": self._encounter_view(observer_id),
         }
+
+    def _encounter_view(self, observer_id):
+        enc = W.encounter_of(self.conn, observer_id)
+        if enc is None:
+            return None
+        seen = [m["character_id"] for m in W.members(self.conn, enc["id"])
+                if W.can_see(self.conn, observer_id, W.char(self.conn, m["character_id"]))]
+        turn = enc["turn_id"]
+        return {"id": enc["id"], "round": enc["round"], "your_turn": turn == observer_id,
+                "turn": self._label(observer_id, turn) if turn in seen else "someone",
+                "order": [self._label(observer_id, c) for c in seen]}
 
     def describe(self, observer_id):
         v = self.view(observer_id)
@@ -266,4 +305,7 @@ class Engine:
         if v["items"]:
             out.append("On the ground: " + ", ".join(i["name"] for i in v["items"]) + ".")
         out.append("Exits: " + ", ".join(e["name"] for e in v["exits"]) + ".")
+        if v["encounter"]:
+            out.append("You are in a fight; " + ("it's your turn." if v["encounter"]["your_turn"]
+                                                 else f"{v['encounter']['turn']} acts next."))
         return " ".join(out)

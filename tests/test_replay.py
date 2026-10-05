@@ -18,7 +18,7 @@ SESSION = [
 
 
 def test_replay_reproduces_events_and_dice():
-    cfg = Config(confirm_irreversible=False)
+    cfg = Config(confirm_irreversible=False)  # encounters on: NPC turns are logged inputs too
     eng = Engine.create(seed=99, config=cfg, world=fixtures.MILL_STREET)
     for i, (actor, text) in enumerate(SESSION):
         eng.submit(actor, text)

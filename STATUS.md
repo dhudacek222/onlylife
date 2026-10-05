@@ -12,7 +12,7 @@ harness first, assets/visuals later.**
 | 2 | Harness: decision model + LLM escalation, references, alternatives, confirmations, per-observer narration | **done, offline**: rules model + Claude adapter + escalation + confirm/clarify/alternatives + facts-only narration; 147 tests green. The Claude path is tested with a fake client only; it has **never run against the real API** |
 | 3 | Asset pipeline spike (Three.js, Quaternius, mobile perf) | deferred by owner. Blocker noted: the Quaternius packs must be downloaded manually (automated itch.io download was refused) |
 | 4 | Building generator v1 | not started |
-| 5 | First street playable single-player | not started |
+| 5 | First street playable single-player | **in progress**: encounters done (initiative, turn gate, join by involvement, flee, timeout, NPC fight routine; DESIGN.md §11). Next: NPC daily routines, guards reacting to witnessed crimes, bounty/contract board, minimal server |
 | 6 | Web client shell | not started |
 | 7 | Multiplayer + offline agents | not started |
 | 8 | Travel | not started |
@@ -26,7 +26,12 @@ harness first, assets/visuals later.**
   Rules model: 95.7% overall, **100% when confident (84/84)**, 100% injection recall, 0 false injections.
 - Part 2 brief saved (`BRIEF_PART2.md`); its conflicts with Part 1 and proposed resolutions: DESIGN.md §10.
 
+## Done (session 3)
+- Encounters (BRIEF §7): 13 new tests, 160 total green. Owner to confirm the "join by involvement" reading (DESIGN.md §11).
+
 ## Next steps
+0. NPC daily routines in code (work/eat/sleep/walk on the global clock) + guards reacting to crimes they witness
+   (join the encounter / arrest); then the bounty/contract board.
 1. Run `python -m harness.eval --claude` once with real credentials (`pip install anthropic`). Record accuracy, cost and
    latency per call; decide OPEN DECISION 16 (decision/narration model vs ≈$0.10/player-hour).
 2. Owner to confirm the DESIGN.md §10 resolutions (map tracking, offline-agent status, caravan logout, server timing).

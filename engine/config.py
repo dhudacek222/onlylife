@@ -30,3 +30,7 @@ class Config:
     risk_xp_steps: tuple = (100, 1000)  # verbal_scaled: xp thresholds for coarse -> fine -> numeric estimates
     llm_model: str = "claude-opus-5-5"  # decision + narration model when an LLM is configured
     llm_effort: str = "low"
+
+    # ---- encounters (BRIEF §7)
+    encounters: bool = True  # turn mode after hostile acts; M1 rule tests switch it off to isolate single actions
+    npc_flee_below: float = 0.5  # non-guard NPCs flee when hp/max_hp is at or below this

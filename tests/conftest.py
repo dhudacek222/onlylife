@@ -6,8 +6,9 @@ from engine.engine import Engine
 
 
 def new(seed=42, **cfg):
-    """M1 rule tests drive the engine directly, so confirmations are off unless a test turns them on."""
+    """M1 rule tests drive single actions directly: confirmations and encounters are off unless a test turns them on."""
     cfg.setdefault("confirm_irreversible", False)
+    cfg.setdefault("encounters", False)
     return Engine.create(seed=seed, config=Config(**cfg))
 
 

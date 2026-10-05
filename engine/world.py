@@ -129,6 +129,26 @@ def detectors(conn, eid):
         "SELECT observer_id FROM perceptions WHERE event_id=? AND detected=1 ORDER BY observer_id", (eid,))]
 
 
+def encounter_of(conn, cid):
+    """The active encounter this character is a member of (and hasn't left), or None."""
+    return q1(conn, "SELECT e.* FROM encounters e JOIN encounter_members m ON m.encounter_id = e.id "
+                    "WHERE m.character_id=? AND m.left_round IS NULL AND e.ended IS NULL ORDER BY e.id LIMIT 1", cid)
+
+
+def encounter(conn, eid):
+    return q1(conn, "SELECT * FROM encounters WHERE id=?", eid)
+
+
+def members(conn, eid):
+    """Active members in turn order: earlier joiners first, then initiative (high first), then id."""
+    return q(conn, "SELECT * FROM encounter_members WHERE encounter_id=? AND left_round IS NULL "
+                   "ORDER BY joined_round, initiative DESC, character_id", eid)
+
+
+def active_encounters(conn):
+    return q(conn, "SELECT * FROM encounters WHERE ended IS NULL ORDER BY id")
+
+
 # ---------------------------------------------------------------- whitelist (the only writes in the engine)
 
 def _insert(conn, table, row):
@@ -260,6 +280,27 @@ def add_trace(conn, eid, kind, item_id, location_id, detail):
 def add_knowledge(conn, observer_id, subject_id, fact, location_id, time, eid):
     _w(conn, "INSERT INTO knowledge (observer_id, subject_id, fact, location_id, time, event_id) "
              "VALUES (?,?,?,?,?,?)", observer_id, subject_id, fact, location_id, time, eid)
+
+
+def add_encounter(conn, location_id, time):
+    return _w(conn, "INSERT INTO encounters (location_id, started) VALUES (?, ?)", location_id, time).lastrowid
+
+
+def add_member(conn, eid, cid, initiative, roll_id, joined_round):
+    _w(conn, "INSERT OR REPLACE INTO encounter_members (encounter_id, character_id, initiative, roll_id, joined_round) "
+             "VALUES (?,?,?,?,?)", eid, cid, initiative, roll_id, joined_round)
+
+
+def leave_encounter(conn, eid, cid, round_):
+    _w(conn, "UPDATE encounter_members SET left_round=? WHERE encounter_id=? AND character_id=?", round_, eid, cid)
+
+
+def set_turn(conn, eid, round_, turn_id):
+    _w(conn, "UPDATE encounters SET round=?, turn_id=? WHERE id=?", round_, turn_id, eid)
+
+
+def end_encounter(conn, eid, time):
+    _w(conn, "UPDATE encounters SET ended=?, turn_id=NULL WHERE id=?", time, eid)
 
 
 def add_trade(conn, from_id, to_id, give_items, give_coins, want_items, want_coins, time):

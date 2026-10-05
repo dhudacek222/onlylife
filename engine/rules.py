@@ -608,6 +608,22 @@ HANDLERS = {
 }
 
 
+FREE_VERBS = {"say", "talk"}  # speaking never costs a turn
+
+
+def turn_gate(c):
+    """Inside an encounter you act on your turn only, and you leave by fleeing (BRIEF §7)."""
+    if c.a.verb in FREE_VERBS:
+        return
+    enc = world.encounter_of(c.conn, c.me["id"])
+    if enc is None:
+        return
+    if enc["turn_id"] != c.me["id"]:
+        raise Impossible("It's not your turn yet.", missing=["your turn"])
+    if c.a.verb == "move":
+        raise Impossible("You're in a fight: the only way out is to flee.", missing=["flee"])
+
+
 def resolve(conn, cfg, actor_id, action, probe=False):
     """Resolve one action inside the caller's transaction. Impossible/ambiguous roll back to a savepoint,
     so they can never leave a write behind; any other exception propagates to the caller's rollback.
@@ -620,6 +636,7 @@ def resolve(conn, cfg, actor_id, action, probe=False):
             raise Impossible(f"There is no character '{actor_id}'.")
         if c.me["status"] == "dead":
             raise Impossible("You are dead.")
+        turn_gate(c)
         res = HANDLERS[action.verb](c, action)
     except Probe as p:
         conn.execute("ROLLBACK TO action")

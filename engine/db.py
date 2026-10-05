@@ -94,6 +94,15 @@ CREATE TABLE model_calls(
   model TEXT NOT NULL, input_tokens INT, output_tokens INT, cache_read_input_tokens INT, latency_ms INT,
   verbs TEXT NOT NULL DEFAULT '[]');
 
+-- encounters (BRIEF §7): turn mode for the people involved in a hostile interaction
+CREATE TABLE encounters(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, location_id TEXT NOT NULL, started INT NOT NULL, ended INT,
+  round INT NOT NULL DEFAULT 1, turn_id TEXT);
+
+CREATE TABLE encounter_members(
+  encounter_id INT NOT NULL, character_id TEXT NOT NULL, initiative INT NOT NULL, roll_id INT NOT NULL,
+  joined_round INT NOT NULL, left_round INT, PRIMARY KEY (encounter_id, character_id));
+
 -- evidence: one row per witness (perception) and per physical trace of every crime event
 CREATE VIEW evidence AS
   SELECT e.id AS event_id, e.time, e.crime, e.actor_id, e.verb, e.outcome, e.location_id,
