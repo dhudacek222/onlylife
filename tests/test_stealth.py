@@ -127,3 +127,49 @@ def test_sneaking_into_a_room_rolls_against_the_people_there(eng):
 def test_heavy_armor_gives_stealth_disadvantage(eng):
     eng.conn.execute("UPDATE items SET location_id=NULL, holder_id='player' WHERE id='plate'")
     assert one(eng, "player", "sneak").rolls[0].mode == "disadvantage"
+
+
+def test_rehiding_in_the_same_tick_invalidates_old_awareness():
+    # regression: visibility compared clock time, so awareness from an earlier hide in the same tick leaked
+    eng = new(chain_actions_cost_separate_turns=False)
+    setskill(eng, "bob", perception=60)
+    setskill(eng, "player", stealth=40)
+    eng.submit("player", "hide and unhide")  # bob notices, same tick
+    setskill(eng, "bob", perception=-60)
+    eng.conn.execute("UPDATE meta SET value = CAST(value AS INT) - 1 WHERE key='clock'")  # force the same tick
+    eng.submit("player", "hide")
+    assert "player" not in [c["id"] for c in eng.view("bob")["characters"]]
+
+
+def test_stealth_modifiers_night_and_guards(eng):
+    place(eng, "player", "tom_house")  # unlit, nobody inside: dex +2, stealth 2, cover 2, crowd 0
+    noon = one(eng, "player", "sneak").rolls[0].modifier
+    eng.submit("player", "unhide")
+    eng.advance(9 * 60)  # 21:00
+    night = one(eng, "player", "sneak").rolls[0].modifier
+    assert (noon, night) == (6, 8)
+
+    eng2 = new()
+    place(eng2, "player", "street")  # lit; cover 1, crowd 1; gareth the guard stands here
+    watched = one(eng2, "player", "sneak").rolls[0].modifier
+    eng2.submit("player", "unhide")
+    place(eng2, "guard", "guard_post")
+    alone = one(eng2, "player", "sneak").rolls[0].modifier
+    assert (watched, alone) == (4, 6)
+
+
+def test_arrival_notices_hidden_people_by_passive_perception(eng):
+    setskill(eng, "wren", stealth=-40)
+    eng.submit("wren", "hide")
+    place(eng, "player", "street")
+    assert one(eng, "player", "go to tavern").outcome == "success"  # passive 13 beats wren's total
+    assert "wren" in [c["id"] for c in eng.view("player")["characters"]]
+    seen = rows(eng, "SELECT subject_id FROM knowledge WHERE observer_id='player' AND fact='seen_at' ORDER BY subject_id")
+    assert ("bob",) in seen  # the arriver notes everyone visible
+
+
+def test_offline_characters_perceive_nothing(eng):
+    setchar(eng, "bob", status="offline")
+    r = one(eng, "player", "take knife")
+    assert "bob" not in r.messages
+    assert rows(eng, "SELECT * FROM perceptions WHERE event_id=? AND observer_id='bob'", r.event_id) == []

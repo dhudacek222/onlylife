@@ -242,7 +242,7 @@ def do_move(c, a):
     if me["hidden"]:  # sneaking in: one fresh stealth roll vs every observer at the destination
         m, mode = stealth_mod(c, dest)
         r = c.roll("stealth", m, mode=mode)
-        world.set_hidden(c.conn, me["id"], 1, me["hidden_since"], r.total)
+        world.set_hidden(c.conn, me["id"], 1, me["hidden_event"], r.total)
         for o in others:
             if passive(o) >= r.total:
                 c.know(o["id"], me["id"], "aware_of")
@@ -482,7 +482,7 @@ def do_sneak(c, a):
         raise Impossible("You are already hidden.")
     m, mode = stealth_mod(c, world.location(c.conn, c.here))
     r = c.roll("stealth", m, mode=mode)
-    world.set_hidden(c.conn, me["id"], 1, c.now, r.total)
+    world.set_hidden(c.conn, me["id"], 1, c.eid, r.total)
     for o in world.present(c.conn, c.here, exclude=me["id"]):  # vs EACH observer's passive perception
         if passive(o) >= r.total:
             c.know(o["id"], me["id"], "aware_of")
@@ -564,7 +564,7 @@ def do_talk(c, a):
     if not a.text:
         raise Impossible("Say what?", missing=["text"])
     res = record(c, "success", target=t and t["id"], data={"text": a.text})
-    if c.me["name"].lower() in a.text.lower():  # introducing yourself
+    if re.search(rf"\b{re.escape(c.me['name'])}\b", a.text, re.I):  # introducing yourself (whole word)
         for o in c.detected:
             c.know(o, c.me["id"], "knows_identity")
     return res

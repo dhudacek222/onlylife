@@ -77,7 +77,7 @@ JSON columns are `TEXT` holding JSON. All ids are TEXT slugs (`"bob"`, `"knife_1
 - `connections(from_id, to_id, door_id NULL, PK(from_id,to_id))` — store both directions; both rows share the door.
 - `housing_tiers(tier PK, windows INT, doors INT, lock_dc INT, cellar INT)`
 - `buildings(location_id PK, tier → housing_tiers, owner_id, cosmetic TEXT, wealth_display INT 1-5, image_ref NULL)` — mechanics come from the tier, cosmetics are text only.
-- `characters(id PK, name, is_npc, role TEXT NULL ['guard','merchant',…], location_id, status ['online','afk','offline','dead'], hp, max_hp, xp, coins INT CHECK ≥0, stats JSON {str,dex,con,int,wis,cha} as scores, skills JSON {stealth,perception,sleight,athletics,lockpicking,…} ints, skill_points, face_shape TEXT (immutable trigger), appearance JSON {hair,clothes,…}, wanted_level INT, hidden INT, hidden_since INT NULL, stealth_total INT NULL)`
+- `characters(id PK, name, is_npc, role TEXT NULL ['guard','merchant',…], location_id, status ['online','afk','offline','dead'], hp, max_hp, xp, coins INT CHECK ≥0, stats JSON {str,dex,con,int,wis,cha} as scores, skills JSON {stealth,perception,sleight,athletics,lockpicking,…} ints, skill_points, face_shape TEXT (immutable trigger), appearance JSON {hair,clothes,…}, wanted_level INT, hidden INT, hidden_event INT NULL, stealth_total INT NULL)`
 - `reputation(character_id, scope, value, PK(character_id,scope))`
 - `items(id PK, type, name, aliases JSON, properties JSON, price INT NULL, location_id NULL, holder_id NULL, flags JSON)` — CHECK exactly one of `location_id`,`holder_id` non-null. **DELETE forbidden by trigger.**
 - `provenance(id PK AUTOINC, item_id, kind ['created','bought','sold','gifted','given','dropped','taken','stolen','looted','traded','transformed'], from_id NULL, to_id NULL, location_id, time, event_id NULL)` — append-only (UPDATE/DELETE forbidden).
@@ -85,7 +85,7 @@ JSON columns are `TEXT` holding JSON. All ids are TEXT slugs (`"bob"`, `"knife_1
 - `perceptions(event_id, observer_id, detected INT, recognized INT, appearance_seen JSON NULL, roll_id NULL, PK(event_id,observer_id))` — witness records for every event; append-only.
 - `traces(id PK AUTOINC, event_id, kind ['bloodied_item','item_left','forced_lock','purchase','body'], item_id NULL, location_id, detail JSON)` — physical evidence; append-only.
 - `VIEW evidence` = events with `crime IS NOT NULL` joined to perceptions + traces.
-- `knowledge(id PK AUTOINC, observer_id, subject_id, fact ['aware_of','seen_at','knows_identity','knows_crime'], location_id NULL, time, event_id NULL)` — append-only. Visibility rule: observer sees subject iff `subject.hidden=0` OR an `aware_of` row exists with `time >= subject.hidden_since`.
+- `knowledge(id PK AUTOINC, observer_id, subject_id, fact ['aware_of','seen_at','knows_identity','knows_crime'], location_id NULL, time, event_id NULL)` — append-only. Visibility rule: observer sees subject iff `subject.hidden=0` OR an `aware_of` row exists with `event_id >= subject.hidden_event` (the sneak event). Compared by event id, not clock time, because many events can share a tick (chained actions with `chain_actions_cost_separate_turns=False`; concurrent players at M5).
 - `dice_log(id PK = roll counter, time, event_id NULL, actor_id, purpose, sides, raw JSON (both dice if adv/dis), mode ['normal','advantage','disadvantage'], modifier, total, dc NULL, success NULL)` — append-only.
 - `trades(id PK AUTOINC, from_id, to_id, give_items JSON, give_coins, want_items JSON, want_coins, status ['pending','accepted','declined','failed'], created, resolved NULL)`
 - `inputs(id PK AUTOINC, kind ['cmd','advance'], actor_id NULL, payload TEXT)` — everything needed for replay.
@@ -111,12 +111,12 @@ Verbs (all resolve against the actor's current location):
 | offer / accept / decline | items held / coins available, both here | trivial | `trades` row; **accept re-validates everything and swaps atomically** or marks `failed` |
 | attack(target, weapon?) | target visible, here, alive; weapon held if named (else best held weapon; none → unarmed) | d20+str mod (+athletics) − unarmed penalty vs AC; advantage if actor hidden and target not aware, or target afk; hp damage = weapon die + str mod (min 1) | ends actor hidden; weapon flag `bloodied` + trace; hp→0: status dead, `murder`, trace `body`, death_mode applied; else `assault` |
 | steal(item or coins, target) | target here, visible, alive; item held by target | d20+dex+sleight vs target passive perception + repeat penalty; advantage if target afk | success: transfer (provenance `stolen`) or half target's coins; target detects only if roll fails; crime `theft` |
-| sneak | not already hidden | stealth = d20+dex+stealth+cover+crowd+(2 if night and not lit) −2 per visible guard; disadvantage with heavy armor | `hidden=1`, `hidden_since=now`, `stealth_total`; each observer whose passive perception ≥ total gets `aware_of` |
+| sneak | not already hidden | stealth = d20+dex+stealth+cover+crowd+(2 if night and not lit) −2 per visible guard; disadvantage with heavy armor | `hidden=1`, `hidden_event=<this event>`, `stealth_total`; each observer whose passive perception ≥ total gets `aware_of` |
 | unhide | hidden | — | `hidden=0` |
 | open/close(door) | door here; open requires unlocked | trivial | door state |
 | unlock/lock(door) | key item held → trivial; unlock w/o key needs a held `lockpick` item → dex+lockpicking vs lock_dc; no key and no lockpick → **impossible** (missing prerequisite listed) | | door state |
 | force(door) | door here, locked | str+athletics vs lock_dc+4 | unlocked+open; trace `forced_lock`; **noisy: everyone in both connected locations detects** |
-| talk(target, text) / say(text) | target visible+here | none | event; listeners get `knows_identity` if actor introduces (`text` contains their own name) |
+| talk(target, text) / say(text) | target visible+here | none | event; listeners get `knows_identity` if actor introduces (`text` contains their own name as a whole word) |
 | use(item) | held, has `properties.on_use` | trivial | apply effect (`heal`), item transforms per `on_use.becomes` (provenance `transformed`) — never deleted |
 | flee(dest) | connected | dex check vs dc_normal | success = move; failure = stay |
 | wait | — | — | event only |

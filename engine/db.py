@@ -33,7 +33,7 @@ CREATE TABLE characters(
   coins INT NOT NULL DEFAULT 0 CHECK (coins >= 0),
   stats TEXT NOT NULL, skills TEXT NOT NULL DEFAULT '{}', skill_points INT NOT NULL DEFAULT 0,
   face_shape TEXT NOT NULL, appearance TEXT NOT NULL DEFAULT '{}', wanted_level INT NOT NULL DEFAULT 0,
-  hidden INT NOT NULL DEFAULT 0, hidden_since INT, stealth_total INT);
+  hidden INT NOT NULL DEFAULT 0, hidden_event INT, stealth_total INT);
 
 CREATE TABLE reputation(
   character_id TEXT REFERENCES characters, scope TEXT, value INT NOT NULL DEFAULT 0,
