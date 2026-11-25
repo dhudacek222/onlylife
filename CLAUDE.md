@@ -6,6 +6,7 @@ Read these before working:
 - `STATUS.md` — what is done, what is in progress, what is next. **Update it at the end of every session.**
 
 ## Commands
+- First-time setup on a new machine: see `SETUP.md`
 - Tests: `python -m pytest -q`
 - Play in the terminal: `python -m engine` (REPL as "player"; `:wait N` advances the clock, `:view` shows what you see)
 - Play from a Claude/ChatGPT app (player's own subscription runs the AI): `python -m engine.mcp_server --db world.db --http` → connector URL `http://host:8000/mcp` (needs `mcp>=2,<3`; no auth yet, keep it local)

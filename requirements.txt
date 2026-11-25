@@ -1,0 +1,6 @@
+# Engine and tests: Python 3.11+ standard library + pytest.
+pytest
+# Play from your Claude / ChatGPT app (engine/mcp_server.py):
+mcp>=2,<3
+# Optional fallback: your own Anthropic API key (engine/claude.py, python -m engine --ai):
+# anthropic
