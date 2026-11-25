@@ -25,6 +25,9 @@ engine/
   rules.py     Deterministic resolution per verb: prerequisites, DCs, modifiers, dice -> whitelist calls
   engine.py    Engine facade: submit/advance/view/replay, transaction per action, template text per observer
   fixtures.py  Demo world ("Mill Street") used by tests and the REPL
+  harness.py   M2 Action Harness: DecisionModel/Narrator Protocols, escalation, confirmations, per-observer narration
+  claude.py    M2 Claude adapters (ClaudeDecision, ClaudeNarrator); optional `anthropic` SDK, imported lazily
+  evals.py     parser eval runner over evals/commands.jsonl
   __main__.py  Tiny REPL: python -m engine
 tests/
 ```
@@ -88,7 +91,7 @@ JSON columns are `TEXT` holding JSON. All ids are TEXT slugs (`"bob"`, `"knife_1
 - `knowledge(id PK AUTOINC, observer_id, subject_id, fact ['aware_of','seen_at','knows_identity','knows_crime'], location_id NULL, time, event_id NULL)` — append-only. Visibility rule: observer sees subject iff `subject.hidden=0` OR an `aware_of` row exists with `event_id >= subject.hidden_event` (the sneak event). Compared by event id, not clock time, because many events can share a tick (chained actions with `chain_actions_cost_separate_turns=False`; concurrent players at M5).
 - `dice_log(id PK = roll counter, time, event_id NULL, actor_id, purpose, sides, raw JSON (both dice if adv/dis), mode ['normal','advantage','disadvantage'], modifier, total, dc NULL, success NULL)` — append-only.
 - `trades(id PK AUTOINC, from_id, to_id, give_items JSON, give_coins, want_items JSON, want_coins, status ['pending','accepted','declined','failed'], created, resolved NULL)`
-- `inputs(id PK AUTOINC, kind ['cmd','advance'], actor_id NULL, payload TEXT)` — everything needed for replay.
+- `inputs(id PK AUTOINC, kind ['cmd','actions','advance'], actor_id NULL, payload TEXT)` — everything needed for replay. `cmd` = text through the deterministic M1 parser; `actions` = JSON list of `Action`s decided by an AI model (replay never calls a model).
 
 ## 6. Rules (M1)
 
@@ -140,6 +143,24 @@ eng = Engine.create(path=":memory:", seed=42, config=Config(), world=fixtures.MI
 results = eng.submit("player", "take knife and attack bob")   # list[Result]
 eng.advance(60)                     # moves global clock, logged in inputs
 eng.view("player")                  # dict: what this observer can see right now
+eng.submit_actions("player", [Action("take", item="knife")])   # structured input (M2 harness), logged as JSON
 eng2 = Engine.replay(fixture, seed, config, eng.inputs())   # identical events + dice_log
 ```
 `Result(action, outcome ['success','failure','impossible','ambiguous','unparsed','skipped'], reason, missing, candidates, rolls: list[Roll], event_id, messages: dict[observer_id, str])` — `rolls` + `reason` make every failure legible (brief §2.9).
+
+## 9. M2 Action Harness (`harness.py`, `claude.py`)
+
+```
+text ─► scene_for(view(actor)) ─► DecisionModel.decide(text, scene) ─► Decision(actions, source, clarify)
+     no actions → Turn("unclear", clarify)          nothing logged, no clock (parser failure is free)
+     any irreversible verb and actor is a player → Turn("confirm", prompt); confirm()/cancel()
+     else Engine.submit_actions() ─► per observer: Narrator.narrate(own engine line, own scene) (players only)
+```
+- **Scene = the only thing a model sees**: the acting player's `view()`, with character ids replaced by opaque refs `c1, c2…` (slug ids would name strangers). Hidden, unnoticed characters are absent by construction. Refs map back to ids after the decision.
+- **DecisionModel tiers**: `Escalating(RuleDecision(), ClaudeDecision())` — the free deterministic parser first; the LLM only when it yields nothing. A model exception falls through to the next tier / "unclear"; it never breaks a turn.
+- **AI output is untrusted input**: JSON-schema structured output (`verb` enum = `VERBS`), then `Action.from_dict` re-validates (unknown verb/field, wrong types, negative coins → rejected → "unclear"). Player text is sent inside a JSON object so it cannot forge the scene or close a tag. Outcomes are still only dice + rules.
+- **Narrator** gets one observer's engine line + that observer's scene; any failure falls back to the engine line. Narration is never fed back into the engine.
+- **Claude adapter**: model `claude-opus-5-5`, `effort="low"` (intent parsing is a simple task), structured outputs, server-side refusal fallback (`fallbacks="default"`). `refusal`/`max_tokens` stop → error → next tier.
+- **Dependencies**: the `anthropic` SDK is the one non-stdlib dependency, imported lazily in `claude.py` only; engine + tests stay stdlib-only and offline (fakes inject `client=`).
+- **Eval** (BRIEF §19): `evals/commands.jsonl`, 132 cases in clean / multi / typo / slang / injection / nonsense. `python -m engine.evals [--model rules|claude|both] [--show-failures]`. Floor enforced in tests: rule tier passes 100% of clean, multi, nonsense.
+- Not yet: risk estimate on confirmation (OPEN DECISION 1 — needs a roll-free DC preview), feasible alternatives as buttons, encounter/turn order.

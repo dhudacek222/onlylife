@@ -1,5 +1,6 @@
 """Engine facade: submit / advance / view / replay. One BEGIN IMMEDIATE transaction per input;
 per-observer text is rendered only from that observer's perception rows."""
+import json
 from contextlib import contextmanager
 
 from engine import db, fixtures, parser, rules
@@ -66,6 +67,8 @@ class Engine:
         for kind, actor_id, payload in inputs:
             if kind == "cmd":
                 eng.submit(actor_id, payload)
+            elif kind == "actions":  # decided by an AI model: replay the decision, never re-ask the model
+                eng.submit_actions(actor_id, [Action.from_dict(d) for d in json.loads(payload)])
             else:
                 eng.advance(int(payload))
         return eng
@@ -84,14 +87,29 @@ class Engine:
         return [tuple(r) for r in self.conn.execute("SELECT kind, actor_id, payload FROM inputs ORDER BY id")]
 
     def submit(self, actor_id, text):
+        """Text through the M1 hardcoded parser (tests, REPL). Logged as text: the parser is deterministic."""
         actions = parser.parse(text)
         if not actions:  # costs nothing: no input row, no event, no clock
             msg = f"I don't understand '{text}'."
             return [Result(Action("?", raw=text), "unparsed", msg, messages={actor_id: msg})]
+        return self._run(actor_id, actions, "cmd", text)
+
+    def submit_actions(self, actor_id, actions):
+        """Already-structured actions (from the M2 harness). Logged as the actions themselves, so replay
+        never depends on a model answering the same way twice."""
+        if not actions:
+            raise ValueError("no actions")
+        return self._run(actor_id, actions, "actions", json.dumps([a.to_dict() for a in actions]))
+
+    def is_player(self, cid):
+        ch = W.char(self.conn, cid)
+        return ch is not None and not ch["is_npc"]
+
+    def _run(self, actor_id, actions, kind, payload):
         separate = self.config.chain_actions_cost_separate_turns
         results = []
         with self._tx():
-            W.log_input(self.conn, "cmd", actor_id, text)
+            W.log_input(self.conn, kind, actor_id, payload)
             for a in actions:
                 if results and results[-1].outcome != "success":
                     results.append(Result(a, "skipped", "An earlier action in this command didn't succeed."))
@@ -122,6 +140,8 @@ class Engine:
         if ch is None:
             d = W.door(self.conn, subject_id)
             return f"the {d['name']}" if d else W.location(self.conn, subject_id)["name"]
+        if not W.can_see(self.conn, observer_id, ch):  # e.g. the hidden target of a witnessed act
+            return "someone"
         if W.knows(self.conn, observer_id, subject_id, "knows_identity"):
             return ch["name"]
         return "a stranger in " + ch["appearance"].get("clothes", "plain clothes")

@@ -84,7 +84,7 @@ CREATE TABLE trades(
   created INT NOT NULL, resolved INT);
 
 CREATE TABLE inputs(
-  id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL CHECK (kind IN ('cmd','advance')),
+  id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL CHECK (kind IN ('cmd','actions','advance')),
   actor_id TEXT, payload TEXT NOT NULL);
 
 -- evidence: one row per witness (perception) and per physical trace of every crime event

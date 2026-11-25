@@ -1,5 +1,5 @@
 """Action schema: verb metadata and the Action / Roll / Result records."""
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from typing import NamedTuple
 
 
@@ -30,6 +30,28 @@ class Action:
     want_item: str | None = None  # offer: item wanted in return
     want_coins: int = 0
     raw: str = ""
+
+    def to_dict(self):
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d):
+        """Strict: unknown verbs or fields raise ValueError (AI output is untrusted input)."""
+        names = {f.name for f in fields(cls)}
+        if set(d) - names:
+            raise ValueError(f"unknown action fields: {sorted(set(d) - names)}")
+        if d.get("verb") not in VERBS:
+            raise ValueError(f"unknown verb: {d.get('verb')!r}")
+        a = cls(**d)
+        for f in ("target", "item", "text", "want_item", "raw"):
+            v = getattr(a, f)
+            if v is not None and not isinstance(v, str):
+                raise ValueError(f"{f} must be a string")
+        for f in ("coins", "want_coins"):
+            v = getattr(a, f)
+            if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+                raise ValueError(f"{f} must be a non-negative integer")
+        return a
 
 
 @dataclass

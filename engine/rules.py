@@ -12,7 +12,11 @@ COINS = {"coins", "coin", "money", "gold", "purse"}
 class Impossible(Exception):
     def __init__(self, reason, missing=(), outcome="impossible", candidates=()):
         super().__init__(reason)
-        self.reason, self.missing, self.outcome, self.candidates = reason, list(missing), outcome, list(candidates)
+        self.reason, self.missing, self.outcome, self.candidates = cap(reason), list(missing), outcome, list(candidates)
+
+
+def cap(text):
+    return text[:1].upper() + text[1:]
 
 
 def mod(score):
@@ -125,6 +129,13 @@ def visible_chars(c):
             if x["id"] != c.me["id"] and world.can_see(c.conn, c.me["id"], x)]
 
 
+def who(c, ch):
+    """How the actor may name a character in reasons: their name only once introduced."""
+    if isinstance(ch, str):
+        ch = world.char(c.conn, ch)
+    return ch["name"] if world.knows(c.conn, c.me["id"], ch["id"], "knows_identity") else "the stranger"
+
+
 def find_char(c, ref, alive=True):
     if not ref:
         raise Impossible(f"{c.a.verb.capitalize()} whom?", missing=["target"])
@@ -132,7 +143,7 @@ def find_char(c, ref, alive=True):
     if not ch:  # same words whether absent or hidden: no leak
         raise Impossible(f"You don't see '{ref}' here.", missing=[ref])
     if alive and ch["status"] == "dead":
-        raise Impossible(f"{ch['name']} is dead.")
+        raise Impossible(f"{who(c, ch)} is dead.")
     return ch
 
 
@@ -206,7 +217,7 @@ def record(c, outcome, target=None, item=None, crime=None, data=None, reason="",
             witnesses += o["status"] != "dead"
     if crime and witnesses:
         world.add_wanted(conn, me["id"], c.cfg.wanted_severity[crime])
-    return Result(c.a, outcome, reason, list(missing), rolls=c.rolls, event_id=c.eid)
+    return Result(c.a, outcome, cap(reason), list(missing), rolls=c.rolls, event_id=c.eid)
 
 
 # ---------------------------------------------------------------- verbs
@@ -306,12 +317,12 @@ def do_buy(c, a):
                              outcome="ambiguous" if ms else "impossible", candidates=[x["id"] for x in ms])
         m = ms[0]
     if m["role"] != "merchant":
-        raise Impossible(f"{m['name']} isn't selling anything.", missing=["merchant"])
+        raise Impossible(f"{who(c, m)} isn't selling anything.", missing=["merchant"])
     if not a.item:
         raise Impossible("Buy what?", missing=["item"])
     it = pick(a.item, [i for i in world.items_held(c.conn, m["id"]) if i["price"] is not None], item_names)
     if not it:
-        raise Impossible(f"{m['name']} doesn't sell '{a.item}'.", missing=[a.item])
+        raise Impossible(f"{who(c, m)} doesn't sell '{a.item}'.", missing=[a.item])
     price, coins = it["price"], c.me["coins"]
     if coins < price:
         raise Impossible(f"The {it['name']} costs {price} coins; you have {coins}.",
@@ -334,7 +345,7 @@ def do_offer(c, a):
     if a.want_item:
         want = pick(a.want_item, world.items_held(c.conn, to["id"]), item_names)
         if not want:
-            raise Impossible(f"{to['name']} doesn't have '{a.want_item}'.", missing=[a.want_item])
+            raise Impossible(f"{who(c, to)} doesn't have '{a.want_item}'.", missing=[a.want_item])
     if not (give or a.coins or want or a.want_coins):
         raise Impossible("Offer what?", missing=["item or coins"])
     if a.coins > c.me["coins"]:
@@ -346,8 +357,10 @@ def do_offer(c, a):
 
 
 def _pending_trade(c, a):
+    """Only trades the actor is a party to and knows about; anything else is indistinguishable from none."""
     if a.target and a.target.isdigit():
-        t = world.trade(c.conn, int(a.target))
+        tid = int(a.target)
+        t = world.trade(c.conn, tid) if world.knows_trade(c.conn, tid, c.me["id"]) else None
     elif a.target:
         t = world.latest_trade(c.conn, c.me["id"], find_char(c, a.target, alive=False)["id"])
     else:
@@ -359,6 +372,12 @@ def _pending_trade(c, a):
     return t
 
 
+def _other_party_here(c, other_id):
+    """Absent and hidden-from-you look the same: no presence test through trades."""
+    o = world.char(c.conn, other_id)
+    return o["location_id"] == c.here and o["status"] != "dead" and world.can_see(c.conn, c.me["id"], o)
+
+
 def do_accept(c, a):
     t = _pending_trade(c, a)
     me = c.me
@@ -367,18 +386,18 @@ def do_accept(c, a):
     frm = world.char(c.conn, t["from_id"])
     # re-validate everything: offering never locks anything, so it may all have moved since
     problems = []
-    if frm["location_id"] != me["location_id"] or frm["status"] == "dead":
-        problems.append(f"{frm['name']} is not here")
+    if not _other_party_here(c, frm["id"]):
+        problems.append(f"{who(c, frm)} is not here")
     for iid in t["give_items"]:
         it = world.item(c.conn, iid)
         if it["holder_id"] != frm["id"]:
-            problems.append(f"{frm['name']} no longer has the {it['name']}")
+            problems.append(f"{who(c, frm)} no longer has the {it['name']}")
     for iid in t["want_items"]:
         it = world.item(c.conn, iid)
         if it["holder_id"] != me["id"]:
             problems.append(f"you no longer have the {it['name']}")
     if frm["coins"] < t["give_coins"]:
-        problems.append(f"{frm['name']} doesn't have {t['give_coins']} coins")
+        problems.append(f"{who(c, frm)} doesn't have {t['give_coins']} coins")
     if me["coins"] < t["want_coins"]:
         problems.append(f"you don't have {t['want_coins']} coins")
     if problems:
@@ -398,10 +417,10 @@ def do_accept(c, a):
 
 def do_decline(c, a):
     t = _pending_trade(c, a)
-    if c.me["id"] not in (t["to_id"], t["from_id"]):
-        raise Impossible(f"Trade #{t['id']} isn't addressed to you.")
-    world.set_trade(c.conn, t["id"], "declined", c.now)
     other = t["from_id"] if t["to_id"] == c.me["id"] else t["to_id"]
+    if not _other_party_here(c, other):  # DESIGN §6: offer/accept/decline need both parties here
+        raise Impossible(f"{who(c, other)} is not here.")
+    world.set_trade(c.conn, t["id"], "declined", c.now)
     return record(c, "success", target=other, data={"trade": t["id"]})
 
 
@@ -457,7 +476,7 @@ def do_steal(c, a):
     if a.item and _norm(a.item) not in COINS:
         it = pick(a.item, world.items_held(c.conn, t["id"]), item_names)
         if not it:
-            raise Impossible(f"{t['name']} doesn't have '{a.item}'.", missing=[a.item])
+            raise Impossible(f"{who(c, t)} doesn't have '{a.item}'.", missing=[a.item])
     dc = passive(t) + c.repeat(t["id"])
     r = c.roll("sleight", mod(me["stats"]["dex"]) + skill(me, "sleight"), dc,
                "advantage" if t["status"] == "afk" else "normal")
@@ -465,7 +484,7 @@ def do_steal(c, a):
         if me["hidden"]:
             c.know(t["id"], me["id"], "aware_of")
         return record(c, "failure", target=t["id"], item=it and it["id"], crime="theft",
-                      reason=f"{t['name']} notices: {r}.", always=[t["id"]])
+                      reason=f"{who(c, t)} notices: {r}.", always=[t["id"]])
     data = {}
     if it:
         world.move_item(c.conn, it["id"], "stolen", holder_id=me["id"], event_id=c.eid)
