@@ -62,6 +62,11 @@ class Engine:
         return eng
 
     @classmethod
+    def open(cls, path, config=None):
+        """Continue an existing world file (the persistent world; create() starts a new one)."""
+        return cls(db.connect(path), config)
+
+    @classmethod
     def replay(cls, fixture, seed, config, inputs):
         eng = cls.create(seed=seed, config=config, world=fixture)
         for kind, actor_id, payload in inputs:

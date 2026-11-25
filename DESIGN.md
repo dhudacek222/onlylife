@@ -28,6 +28,8 @@ engine/
   harness.py   M2 Action Harness: DecisionModel/Narrator Protocols, escalation, confirmations, per-observer narration
   claude.py    M2 Claude adapters (ClaudeDecision, ClaudeNarrator); optional `anthropic` SDK, imported lazily
   evals.py     parser eval runner over evals/commands.jsonl
+  connector.py the game as tools for a player's own AI assistant (look / act), stdlib only
+  mcp_server.py thin MCP 2.x wrapper around connector.Game (the only module importing `mcp`)
   __main__.py  Tiny REPL: python -m engine
 tests/
 ```
@@ -164,3 +166,20 @@ text ─► scene_for(view(actor)) ─► DecisionModel.decide(text, scene) ─�
 - **Dependencies**: the `anthropic` SDK is the one non-stdlib dependency, imported lazily in `claude.py` only; engine + tests stay stdlib-only and offline (fakes inject `client=`).
 - **Eval** (BRIEF §19): `evals/commands.jsonl`, 132 cases in clean / multi / typo / slang / injection / nonsense. `python -m engine.evals [--model rules|claude|both] [--show-failures]`. Floor enforced in tests: rule tier passes 100% of clean, multi, nonsense.
 - Not yet: risk estimate on confirmation (OPEN DECISION 1 — needs a roll-free DC preview), feasible alternatives as buttons, encounter/turn order.
+
+## 10. Player-subscription play: the game as an MCP connector (`connector.py`, `mcp_server.py`)
+
+Players bring their own Claude / ChatGPT subscription; we pay for no model calls. Subscription credentials cannot
+legally be used by our code (Anthropic forbids third-party use of Free/Pro/Max OAuth), so the direction is inverted:
+the player's app calls **our** tools. The player's assistant is both DecisionModel and Narrator.
+
+- Tools: `look()` → `{scene, perceived}`; `act(actions, confirm=false)` → `{status: done|needs_confirmation|invalid,
+  outcomes, you_perceive, earlier, scene}`. Server `instructions` = engine-is-truth rules + `VERB_GUIDE`.
+- Same guarantees as §9: the assistant only ever receives its player's scene and its player's engine lines; actions
+  are re-validated by `Action.from_dict`; irreversible verbs need `confirm=true` (the assistant must ask the human).
+  It can mis-narrate to its own player, never change the world beyond the whitelist.
+- Refs are **stable per player** (`c1`, `c2`… assigned on first sight), because someone may arrive between look and act.
+- Lines other players perceive go to an in-memory per-player inbox, delivered on their next look/act.
+- `Game` serializes all engine access with a lock (single authoritative writer); the SQLite connection allows
+  cross-thread use for that reason. `Engine.open(path)` continues a persistent world.
+- ponytail: one player per process, no auth. M5: MCP OAuth → token → character id, one server for all players.

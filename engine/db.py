@@ -113,8 +113,9 @@ SCHEMA += "".join(
 
 
 def connect(path=":memory:"):
-    """Autocommit connection (isolation_level=None): callers open transactions explicitly."""
-    conn = sqlite3.connect(path, isolation_level=None)
+    """Autocommit connection (isolation_level=None): callers open transactions explicitly.
+    check_same_thread=False: servers call from worker threads; they serialize access (connector.Game.lock)."""
+    conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
