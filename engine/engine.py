@@ -1,71 +1,50 @@
-"""Engine facade: submit / advance / view / replay. One BEGIN IMMEDIATE transaction per input;
-per-observer text is rendered only from that observer's perception rows."""
+"""Engine facade: submit / advance / view / replay. The M2 harness loop lives in submit():
+text -> DecisionModel -> (refuse | unparsed | clarify | confirm) -> execute: one BEGIN IMMEDIATE transaction
+per input. Narration is built per observer from that observer's perception row only."""
+import json
 from contextlib import contextmanager
 
-from engine import db, fixtures, parser, rules
+from engine import db, encounters, fixtures, npc, rules
 from engine import world as W
-from engine.actions import Action, Result
+from engine.actions import VERBS, Action, Result, to_command
 from engine.config import Config
+from engine.dice import success_probability
+from harness.narration import TemplateNarrator
+from harness.rules_model import RulesDecisionModel
 
-YOU = {
-    "move": "You go to {target}.", "flee": "You flee to {target}.", "flee:failure": "You try to flee.",
-    "look": "You look around.", "take": "You take {item}.", "drop": "You drop {item}.",
-    "give": "You give {item} to {target}.", "buy": "You buy {item} from {target} for {price} coins.",
-    "offer": "You offer {target} {deal} (trade #{trade}).", "accept": "You accept trade #{trade} from {target}.",
-    "accept:failure": "Trade #{trade} with {target} falls through.", "decline": "You decline trade #{trade}.",
-    "attack": "You hit {target}{with} for {damage} damage.", "attack:failure": "You attack {target}{with}.",
-    "steal": "You steal {loot} from {target}.", "steal:failure": "You try to steal from {target}.",
-    "sneak": "You slip out of sight.", "unhide": "You step out of hiding.",
-    "open": "You open {target}.", "close": "You close {target}.", "lock": "You lock {target}.",
-    "unlock": "You unlock {target}.", "unlock:failure": "You try to pick {target}.",
-    "force": "You force {target} open.", "force:failure": "You throw yourself against {target}.",
-    "talk": 'You say to {target}: "{text}"', "say": 'You say: "{text}"', "use": "You use {item}.",
-    "wait": "You wait.",
-}
-THEM = {
-    "move": "{actor} goes to {target}.", "flee": "{actor} flees to {target}.",
-    "flee:failure": "{actor} tries to flee but can't get away.", "look": "{actor} looks around.",
-    "take": "{actor} takes {item}.", "drop": "{actor} drops {item}.", "give": "{actor} gives {item} to {target}.",
-    "buy": "{actor} buys {item} from {target}.", "offer": "{actor} offers {target} {deal} (trade #{trade}).",
-    "accept": "{actor} accepts a trade from {target}.",
-    "accept:failure": "A trade between {actor} and {target} falls through.",
-    "decline": "{actor} declines a trade with {target}.",
-    "attack": "{actor} hits {target}{with} for {damage} damage.", "attack:failure": "{actor} attacks {target}{with} and misses.",
-    "steal": "{actor} steals {loot} from {target}.", "steal:failure": "{actor} tries to steal from {target}!",
-    "sneak": "{actor} tries to slip out of sight, but you keep track of them.",
-    "unhide": "{actor} steps out of hiding.", "open": "{actor} opens {target}.", "close": "{actor} closes {target}.",
-    "lock": "{actor} locks {target}.", "unlock": "{actor} unlocks {target}.",
-    "unlock:failure": "{actor} fiddles with the lock of {target}.",
-    "force": "CRASH! {actor} forces {target} open.", "force:failure": "BANG! {actor} throws themselves against {target}.",
-    "talk": '{actor} says to {target}: "{text}"', "say": '{actor} says: "{text}"', "use": "{actor} uses {item}.",
-    "wait": "{actor} waits.",
-}
-
-
-class _Blank(dict):
-    def __missing__(self, key):
-        return ""
+REFUSED = "The world doesn't bend to words like that. Say what your character does."
+CANCEL = {"label": "Cancel", "command": None}
 
 
 class Engine:
-    def __init__(self, conn, config=None):
+    def __init__(self, conn, config=None, model=None, narrator=None):
         self.conn, self.config = conn, config or Config()
+        self.model = model or RulesDecisionModel()
+        self.template = TemplateNarrator()
+        self.narrator = narrator or self.template  # used for free text; buttons always get templates
 
     @classmethod
-    def create(cls, path=":memory:", seed=42, config=None, world=None):
+    def create(cls, path=":memory:", seed=42, config=None, world=None, model=None, narrator=None):
         conn = db.connect(path)
         db.init(conn)
-        eng = cls(conn, config)
+        eng = cls(conn, config, model, narrator)
         with eng._tx():
             W.load_fixture(conn, world or fixtures.MILL_STREET, seed)
         return eng
 
     @classmethod
+    def open(cls, path, config=None, model=None, narrator=None):
+        """Continue an existing world file (the persistent world; create() starts a new one)."""
+        return cls(db.connect(path), config, model, narrator)
+
+    @classmethod
     def replay(cls, fixture, seed, config, inputs):
+        """Re-executes the logged DECIDED actions: no model is consulted, so replay is exact."""
         eng = cls.create(seed=seed, config=config, world=fixture)
         for kind, actor_id, payload in inputs:
             if kind == "cmd":
-                eng.submit(actor_id, payload)
+                p = json.loads(payload)
+                eng._execute(actor_id, p["text"], [Action.from_dict(a) for a in p["actions"]])
             else:
                 eng.advance(int(payload))
         return eng
@@ -83,26 +62,176 @@ class Engine:
     def inputs(self):
         return [tuple(r) for r in self.conn.execute("SELECT kind, actor_id, payload FROM inputs ORDER BY id")]
 
-    def submit(self, actor_id, text):
-        actions = parser.parse(text)
-        if not actions:  # costs nothing: no input row, no event, no clock
+    # ------------------------------------------------------------ the harness loop
+
+    def submit(self, actor_id, text, confirm=False, via="text"):
+        """via="button": the text is a canonical command from our own buttons (template narration)."""
+        if W.char(self.conn, actor_id) is None:
+            return [Result(Action("?", raw=text), "impossible", f"There is no character '{actor_id}'.")]
+        d = self.model.decide(text, self.view(actor_id))
+        if d.usage:
+            with self._tx():
+                W.log_model_call(self.conn, actor_id, "decide", d.usage, [a.verb for a in d.actions])
+        if d.injection:  # costs nothing, like unparsed input
+            return [Result(Action("?", raw=text), "refused", REFUSED, messages={actor_id: REFUSED})]
+        if not d.actions:
             msg = f"I don't understand '{text}'."
-            return [Result(Action("?", raw=text), "unparsed", msg, messages={actor_id: msg})]
+            return [Result(Action("?", raw=text), "unparsed", msg, messages={actor_id: msg},
+                           alternatives=[{"label": s, "command": s} for s in d.suggestions])]
+        command = " and ".join(to_command(a) for a in d.actions)
+        risky = any(VERBS[a.verb].irreversible for a in d.actions)
+        unsure = d.confidence < (self.config.escalate_below if risky else self.config.clarify_below)
+        if unsure:  # never guess silently on irreversible actions; don't burn turns on wild guesses either
+            msg = f"Did you mean: {command}?"
+            return [Result(d.actions[0], "clarify", msg, messages={actor_id: msg},
+                           alternatives=[{"label": command, "command": command}, CANCEL])]
+        return self.submit_actions(actor_id, d.actions, confirm, text, template=via == "button")
+
+    def submit_actions(self, actor_id, actions, confirm=False, text="", template=True):
+        """Structured actions already decided (by our decision model, or by a player's own AI through the
+        connector): confirm irreversible ones with a risk estimate, then execute. Never trusts them further."""
+        if not actions:
+            raise ValueError("no actions")
+        if self.config.confirm_irreversible and not confirm and any(VERBS[a.verb].irreversible for a in actions):
+            stop = self._preview(actor_id, actions)
+            if stop.outcome == "confirm":
+                command = " and ".join(to_command(a) for a in actions)
+                stop.alternatives = [{"label": f"Yes: {command}", "command": command, "confirm": True}, CANCEL]
+            return [stop]
+        return self._execute(actor_id, text, actions, template) + self._npc_turns()
+
+    def is_player(self, cid):
+        ch = W.char(self.conn, cid)
+        return ch is not None and not ch["is_npc"]
+
+    def timeout(self, encounter_id):
+        """The server calls this when the turn timer (Config.turn_timer_seconds) runs out: the member whose turn it
+        is takes the default action. Logged like any command, so replay needs no clock."""
+        enc = W.encounter(self.conn, encounter_id)
+        if enc is None or enc["ended"] is not None or enc["turn_id"] is None:
+            return []
+        return self._execute(enc["turn_id"], "(timeout)", [Action("wait")]) + self._npc_turns()
+
+    def _npc_turns(self):
+        """Play every NPC whose turn it is, until a human is up (or nobody is fighting)."""
+        results = []
+        for _ in range(200):  # ponytail: hard stop against NPC-only fights that never end; M3 routines replace it
+            enc = next((e for e in W.active_encounters(self.conn)
+                        if e["turn_id"] and W.char(self.conn, e["turn_id"])["is_npc"]), None)
+            if enc is None:
+                break
+            nid = enc["turn_id"]
+            rs = self._execute(nid, "(npc)", [npc.choose(self.conn, self.config, nid, enc)])
+            if not rs[0].event_id:  # e.g. its attacker is hidden from it: it holds its ground
+                rs = self._execute(nid, "(npc)", [Action("wait")])
+            results += rs
+        return results
+
+    def _preview(self, actor_id, actions):
+        """Dry-run the chain up to its first irreversible action, then roll everything back. Returns that action's
+        'confirm' Result with a risk estimate, or the impossible/ambiguous Result that would stop the chain."""
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            for a in actions:
+                if VERBS[a.verb].irreversible:
+                    p = rules.resolve(self.conn, self.config, actor_id, a, probe=True)
+                    if isinstance(p, Result) and p.outcome in ("impossible", "ambiguous"):
+                        return self._stopped(actor_id, a, p)
+                    msg = self._risk(actor_id, a, p)
+                    return Result(a, "confirm", msg, messages={actor_id: msg})
+                r = rules.resolve(self.conn, self.config, actor_id, a)
+                if r.outcome in ("impossible", "ambiguous"):
+                    return self._stopped(actor_id, a, r)
+                if r.outcome != "success":  # a dice-dependent step: we can't promise what comes after it
+                    msg = f"First you'd {self._spoken(actor_id, a)}; what follows depends on how that goes. Go ahead?"
+                    return Result(a, "confirm", msg, messages={actor_id: msg})
+        finally:
+            self.conn.execute("ROLLBACK")
+        raise AssertionError("no irreversible action in a risky chain")
+
+    def _stopped(self, actor_id, action, res):
+        res.messages = {actor_id: res.reason}
+        res.alternatives = self._alternatives(actor_id, action, res)
+        return res
+
+    def _spoken(self, actor_id, action):
+        """The action as the actor would say it: a character target by the label they know, never its id."""
+        if action.target and W.char(self.conn, action.target):
+            label = self._label(actor_id, action.target)
+            action = Action(**{**action.__dict__, "target": "the stranger" if label.startswith("a stranger") else label})
+        return to_command(action)
+
+    def _risk(self, actor_id, action, probe):
+        """Verbal risk estimate (OPEN DECISION 1): precision grows with the character's experience."""
+        crime = VERBS[action.verb].crime
+        tail = f" It is a crime ({crime}) if anyone sees it." if crime else " This can't be undone."
+        mode = self.config.risk_display
+        if not isinstance(probe, rules.Probe) or mode == "none":
+            return f"Are you sure you want to {self._spoken(actor_id, action)}?{tail}"
+        p = float(success_probability(probe.modifier, probe.dc, probe.mode))
+        xp = W.char(self.conn, actor_id)["xp"]
+        coarse, fine = self.config.risk_xp_steps
+        if mode == "exact" or xp >= fine:
+            est = f"about {round(p * 100)}% to succeed" if mode == "exact" else f"roughly {round(p * 10)} in 10"
+        elif xp >= coarse:
+            est = next(w for t, w in ((0.15, "almost hopeless"), (0.4, "unlikely"), (0.6, "a coin toss"),
+                                      (0.85, "likely"), (1.01, "almost certain")) if p < t)
+        else:
+            est = "poor" if p < 0.35 else "even" if p < 0.7 else "good"
+        return f"{self._spoken(actor_id, action).capitalize()}? Your odds look {est}.{tail}"
+
+    def _alternatives(self, actor_id, action, res):
+        """Feasible next steps instead of a bare 'no' (BRIEF §5.4). Built from the actor's view only."""
+        v = self.view(actor_id)
+        held = {i["name"] for i in v["inventory"]}
+        types = {i["type"] for i in v["inventory"]}
+        out = []
+        for m in res.missing:
+            if m.startswith("unlocked "):  # a locked door in the way
+                door = m[len("unlocked "):]
+                if "key" in types or "lockpick" in types:
+                    out.append(f"unlock {door}")
+                out.append(f"force {door}")
+            elif m == "flee":  # in a fight, walking away isn't an option
+                out += [f"flee to {e['name']}" for e in v["exits"]]
+            elif m == "lockpick":
+                out += [f"take {i['name']}" for i in v["items"] if i["type"] == "lockpick"]
+                if action.target:
+                    out.append(f"force {action.target}")
+            elif action.verb == "attack" and action.item and m not in held:  # named weapon not in hand
+                if any(action.item in (i["name"], *i["aliases"]) for i in v["items"]):
+                    out.append(f"take {action.item} and attack {action.target}")
+                out.append(f"attack {action.target}")
+        if res.outcome == "ambiguous":
+            out += [to_command(Action(**{**action.__dict__, "target" if action.target else "item": c}))
+                    for c in res.candidates]
+        out.append("look around")
+        return [{"label": c, "command": c} for c in dict.fromkeys(out)] + [CANCEL]
+
+    def _execute(self, actor_id, text, actions, template=True):
         separate = self.config.chain_actions_cost_separate_turns
+        narrator = self.template if template else self.narrator
         results = []
         with self._tx():
-            W.log_input(self.conn, "cmd", actor_id, text)
+            W.log_input(self.conn, "cmd", actor_id, {"text": text, "actions": [a.to_dict() for a in actions]})
             for a in actions:
                 if results and results[-1].outcome != "success":
                     results.append(Result(a, "skipped", "An earlier action in this command didn't succeed."))
                     continue
                 r = rules.resolve(self.conn, self.config, actor_id, a)
+                if r.event_id and self.config.encounters:
+                    encounters.after_action(self.conn, actor_id, a.verb, r.event_id)
                 if r.event_id:
-                    r.messages = self._render(r, actor_id)
+                    r.messages = {}
+                    for o in W.detectors(self.conn, r.event_id):
+                        r.messages[o] = narrator.narrate(self.facts(o, r))
+                        if getattr(narrator, "last_usage", None):
+                            W.log_model_call(self.conn, o, "narrate", narrator.last_usage, [a.verb])
+                            narrator.last_usage = None
                     if separate:
                         W.advance_clock(self.conn, 1)
                 else:
-                    r.messages = {actor_id: r.reason}
+                    self._stopped(actor_id, a, r)
                 results.append(r)
             if not separate and any(r.event_id for r in results):
                 W.advance_clock(self.conn, 1)
@@ -113,7 +242,7 @@ class Engine:
             W.log_input(self.conn, "advance", None, str(ticks))
             W.advance_clock(self.conn, ticks)
 
-    # ------------------------------------------------------------ per-observer output
+    # ------------------------------------------------------------ per-observer facts
 
     def _label(self, observer_id, subject_id):
         if subject_id == observer_id:
@@ -122,37 +251,33 @@ class Engine:
         if ch is None:
             d = W.door(self.conn, subject_id)
             return f"the {d['name']}" if d else W.location(self.conn, subject_id)["name"]
+        if not W.can_see(self.conn, observer_id, ch):  # e.g. the hidden target of a witnessed act
+            return "someone"
         if W.knows(self.conn, observer_id, subject_id, "knows_identity"):
             return ch["name"]
         return "a stranger in " + ch["appearance"].get("clothes", "plain clothes")
 
-    def _render(self, res, actor_id):
+    def facts(self, observer_id, res):
+        """Everything a narrator may use for this observer: labels as THEY know them, no ids, no hidden
+        entities they haven't noticed, rolls only for the actor. Called only for detecting observers."""
         ev = W.event(self.conn, res.event_id)
-        d, verb = ev["data"], ev["verb"]
-        key = f"{verb}:failure" if ev["outcome"] == "failure" else verb
-        msgs = {}
-        for o in W.detectors(self.conn, res.event_id):
-            you = o == actor_id
-            table = YOU if you else THEM
-            f = _Blank(d)
-            f["actor"] = self._label(o, ev["actor_id"])
-            f["target"] = self._label(o, ev["target_id"]) if ev["target_id"] else ""
-            f["item"] = f"the {d['item_name']}" if d.get("item_name") else ""
-            f["loot"] = f"{d['coins']} coins" if "coins" in d else f["item"]
-            f["with"] = f" with the {d['weapon']}" if d.get("weapon") else " barehanded" if verb == "attack" else ""
-            text = table.get(key, table[verb]).format_map(f)
-            if d.get("killed"):
-                text += " You die." if o == ev["target_id"] else f" {f['target'][0].upper()}{f['target'][1:]} dies."
-            if you:
-                text += f" {res.reason}" if res.reason else "".join(f" ({r})" for r in res.rolls)
-                if d.get("found"):
-                    text += " You spot " + ", ".join(self._label(o, s) for s in d["found"]) + "!"
-                if d.get("healed") is not None:
-                    text += f" You recover {d['healed']} hp."
-                if verb in ("look", "move", "flee") and ev["outcome"] == "success":
-                    text += " " + self.describe(o)
-            msgs[o] = text[0].upper() + text[1:]
-        return msgs
+        d, you = ev["data"], observer_id == ev["actor_id"]
+        f = {"verb": ev["verb"], "outcome": ev["outcome"], "you_acted": you,
+             "actor": self._label(observer_id, ev["actor_id"]),
+             "target": self._label(observer_id, ev["target_id"]) if ev["target_id"] else "",
+             "target_is_you": ev["target_id"] == observer_id}
+        for k in ("item_name", "weapon", "damage", "killed", "coins", "deal", "trade", "text", "price"):
+            if d.get(k) is not None:
+                f["item" if k == "item_name" else k] = d[k]
+        if you:
+            f["reason"], f["rolls"] = res.reason, [str(r) for r in res.rolls]
+            if d.get("found"):
+                f["found"] = [self._label(observer_id, s) for s in d["found"]]
+            if d.get("healed") is not None:
+                f["healed"] = d["healed"]
+            if ev["verb"] in ("look", "move", "flee") and ev["outcome"] == "success":
+                f["scene"] = self.describe(observer_id)
+        return f
 
     def view(self, observer_id):
         """What this observer can perceive right now. Hidden characters they aren't aware of don't exist here."""
@@ -162,8 +287,12 @@ class Engine:
         exits = []
         for e in W.exits(conn, here):
             d = e["door_id"] and W.door(conn, e["door_id"])
-            exits.append({"id": e["id"], "name": e["name"],
+            exits.append({"id": e["id"], "name": e["name"], "tags": e["tags"],
                           "door": d and {"name": d["name"], "locked": bool(d["locked"]), "open": bool(d["is_open"])}})
+
+        def thing(i):
+            return {"id": i["id"], "name": i["name"], "type": i["type"], "aliases": i["aliases"]}
+
         return {
             "time": W.now(conn),
             "you": {**{k: me[k] for k in ("id", "name", "hp", "max_hp", "coins", "status", "wanted_level")},
@@ -171,12 +300,26 @@ class Engine:
             "location": {"id": here, "name": W.location(conn, here)["name"]},
             "exits": exits,
             # ponytail: ids are readable slugs, so they name strangers; switch to opaque ids when disguises land
-            "characters": [{"id": c["id"], "name": self._label(observer_id, c["id"]), "status": c["status"]}
+            "characters": [{"id": c["id"], "name": self._label(observer_id, c["id"]), "status": c["status"],
+                            **({"wares": [dict(thing(i), price=i["price"]) for i in W.items_held(conn, c["id"])
+                                          if i["price"] is not None]} if c["role"] == "merchant" else {})}
                            for c in W.chars_at(conn, here)
                            if c["id"] != observer_id and W.can_see(conn, observer_id, c)],
-            "items": [{"id": i["id"], "name": i["name"]} for i in W.items_at(conn, here)],
-            "inventory": [{"id": i["id"], "name": i["name"]} for i in W.items_held(conn, observer_id)],
+            "items": [thing(i) for i in W.items_at(conn, here)],
+            "inventory": [thing(i) for i in W.items_held(conn, observer_id)],
+            "encounter": self._encounter_view(observer_id),
         }
+
+    def _encounter_view(self, observer_id):
+        enc = W.encounter_of(self.conn, observer_id)
+        if enc is None:
+            return None
+        seen = [m["character_id"] for m in W.members(self.conn, enc["id"])
+                if W.can_see(self.conn, observer_id, W.char(self.conn, m["character_id"]))]
+        turn = enc["turn_id"]
+        return {"id": enc["id"], "round": enc["round"], "your_turn": turn == observer_id,
+                "turn": self._label(observer_id, turn) if turn in seen else "someone",
+                "order": [self._label(observer_id, c) for c in seen]}
 
     def describe(self, observer_id):
         v = self.view(observer_id)
@@ -187,4 +330,7 @@ class Engine:
         if v["items"]:
             out.append("On the ground: " + ", ".join(i["name"] for i in v["items"]) + ".")
         out.append("Exits: " + ", ".join(e["name"] for e in v["exits"]) + ".")
+        if v["encounter"]:
+            out.append("You are in a fight; " + ("it's your turn." if v["encounter"]["your_turn"]
+                                                 else f"{v['encounter']['turn']} acts next."))
         return " ".join(out)

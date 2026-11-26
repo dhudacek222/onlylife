@@ -22,3 +22,15 @@ class Config:
     wanted_severity: dict = field(  # 12
         default_factory=lambda: {"theft": 1, "trespass": 1, "burglary": 2, "assault": 2, "murder": 4})
     ticks_per_day: int = 1440  # 13  1 tick = 1 in-game minute
+
+    # ---- M2 harness
+    confirm_irreversible: bool = True  # irreversible verbs need a confirmed second submit (BRIEF §5.5)
+    escalate_below: float = 0.8  # decision confidence below this -> ask the LLM (if any); irreversible -> clarify
+    clarify_below: float = 0.65  # below this even reversible actions are offered as "Did you mean...?", not run
+    risk_xp_steps: tuple = (100, 1000)  # verbal_scaled: xp thresholds for coarse -> fine -> numeric estimates
+    llm_model: str = "claude-opus-5-5"  # decision + narration model when an LLM is configured
+    llm_effort: str = "low"
+
+    # ---- encounters (BRIEF §7)
+    encounters: bool = True  # turn mode after hostile acts; M1 rule tests switch it off to isolate single actions
+    npc_flee_below: float = 0.5  # non-guard NPCs flee when hp/max_hp is at or below this

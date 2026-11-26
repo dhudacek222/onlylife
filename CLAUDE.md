@@ -1,17 +1,21 @@
 # ReadyOne / onlylife — AI-driven persistent world engine
 
 Read these before working:
-- `BRIEF.md` — the product brief and its non-negotiable principles (engine = source of truth, AI never mutates state, whitelist consequences, nothing vanishes, every action leaves evidence, per-observer information, legible fairness).
+- `BRIEF.md` + `BRIEF_PART2.md` (world, client, visuals; Part 2 wins on conflicts) — the product brief and its non-negotiable principles (engine = source of truth, AI never mutates state, whitelist consequences, nothing vanishes, every action leaves evidence, per-observer information, legible fairness).
 - `DESIGN.md` — binding contract: stack, module boundaries, DB schema, rules table, OPEN DECISIONS (all live in `engine/config.py`), Engine API.
+- `RESEARCH.md` — why AI RPGs feel soft and the design rules that prevent it (code decides, LLM voices).
 - `STATUS.md` — what is done, what is in progress, what is next. **Update it at the end of every session.**
 
 ## Commands
+- First-time setup on a new machine: see `SETUP.md`
 - Tests: `python -m pytest -q`
-- Play in the terminal: `python -m engine` (REPL as "player"; `:wait N` advances the clock, `:view` shows what you see)
+- Play in the terminal: `python -m engine` (REPL as "player"; `:wait N` advances the clock, `:view` shows what you see, numbers press buttons); `--claude` adds LLM escalation + narration (needs `pip install anthropic`)
+- Play from a Claude/ChatGPT app (player's own subscription runs the AI): `python -m engine.mcp_server --db world.db --http` → connector URL `http://host:8000/mcp` (needs `mcp>=2,<3`; no auth yet, keep it local). Setup on a PC: `SETUP.md`
+- Parser eval: `python -m harness.eval` (free, rules model) / `--claude` (real API, costs money)
 
 ## Rules of the codebase
-- Python 3.11, stdlib only (+ pytest). No new dependencies without a strong reason.
-- `engine/world.py` is the ONLY module that writes world tables. AI modules (M2+) must never import it; they produce `Action`s for `engine.py`.
+- Python 3.11, stdlib only (+ pytest). No new dependencies without a strong reason. Exceptions, each confined to one module and imported nowhere else: `mcp` (engine/mcp_server.py), `anthropic` (harness/claude.py, lazy).
+- `engine/world.py` is the ONLY module that writes world tables. AI modules (`harness/`) must never import `world`, `db` or `rules` (test-enforced); they produce `Action`s for `engine.py`, and model output is validated as untrusted.
 - DB triggers enforce no-delete, append-only logs, one-place items, coins ≥ 0, immutable face_shape. Never weaken them.
 - Determinism: all randomness goes through `engine/dice.py`; every SELECT that affects outcomes has ORDER BY; replay must stay identical.
 - Hidden entities must never leak into another observer's messages, view(), reference resolution or knowledge.

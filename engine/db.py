@@ -33,7 +33,7 @@ CREATE TABLE characters(
   coins INT NOT NULL DEFAULT 0 CHECK (coins >= 0),
   stats TEXT NOT NULL, skills TEXT NOT NULL DEFAULT '{}', skill_points INT NOT NULL DEFAULT 0,
   face_shape TEXT NOT NULL, appearance TEXT NOT NULL DEFAULT '{}', wanted_level INT NOT NULL DEFAULT 0,
-  hidden INT NOT NULL DEFAULT 0, hidden_since INT, stealth_total INT);
+  hidden INT NOT NULL DEFAULT 0, hidden_event INT, stealth_total INT);
 
 CREATE TABLE reputation(
   character_id TEXT REFERENCES characters, scope TEXT, value INT NOT NULL DEFAULT 0,
@@ -83,9 +83,25 @@ CREATE TABLE trades(
   status TEXT NOT NULL CHECK (status IN ('pending','accepted','declined','failed')),
   created INT NOT NULL, resolved INT);
 
+-- cmd payload = JSON {"text", "actions"}: the DECIDED actions, so replay never re-asks a model
 CREATE TABLE inputs(
   id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL CHECK (kind IN ('cmd','advance')),
   actor_id TEXT, payload TEXT NOT NULL);
+
+-- cost telemetry (BRIEF §17): one row per model call, never read by rules
+CREATE TABLE model_calls(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, time INT NOT NULL, actor_id TEXT, purpose TEXT NOT NULL,
+  model TEXT NOT NULL, input_tokens INT, output_tokens INT, cache_read_input_tokens INT, latency_ms INT,
+  verbs TEXT NOT NULL DEFAULT '[]');
+
+-- encounters (BRIEF §7): turn mode for the people involved in a hostile interaction
+CREATE TABLE encounters(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, location_id TEXT NOT NULL, started INT NOT NULL, ended INT,
+  round INT NOT NULL DEFAULT 1, turn_id TEXT);
+
+CREATE TABLE encounter_members(
+  encounter_id INT NOT NULL, character_id TEXT NOT NULL, initiative INT NOT NULL, roll_id INT NOT NULL,
+  joined_round INT NOT NULL, left_round INT, PRIMARY KEY (encounter_id, character_id));
 
 -- evidence: one row per witness (perception) and per physical trace of every crime event
 CREATE VIEW evidence AS
@@ -113,8 +129,9 @@ SCHEMA += "".join(
 
 
 def connect(path=":memory:"):
-    """Autocommit connection (isolation_level=None): callers open transactions explicitly."""
-    conn = sqlite3.connect(path, isolation_level=None)
+    """Autocommit connection (isolation_level=None): callers open transactions explicitly.
+    check_same_thread=False: servers call from worker threads; they serialize access (connector.Game.lock)."""
+    conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")

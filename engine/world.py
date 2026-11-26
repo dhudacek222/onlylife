@@ -79,17 +79,19 @@ def door_sides(conn, did):
     return [r[0] for r in conn.execute("SELECT from_id FROM connections WHERE door_id=? ORDER BY from_id", (did,))]
 
 
-def knows(conn, observer_id, subject_id, fact, since=None):
+def knows(conn, observer_id, subject_id, fact, since_event=None):
     return conn.execute(
-        "SELECT 1 FROM knowledge WHERE observer_id=? AND subject_id=? AND fact=? AND (? IS NULL OR time>=?) LIMIT 1",
-        (observer_id, subject_id, fact, since, since)).fetchone() is not None
+        "SELECT 1 FROM knowledge WHERE observer_id=? AND subject_id=? AND fact=? "
+        "AND (? IS NULL OR event_id>=?) LIMIT 1",
+        (observer_id, subject_id, fact, since_event, since_event)).fetchone() is not None
 
 
 def can_see(conn, observer_id, subject):
-    """The visibility rule: subject not hidden, or observer became aware of them since they hid."""
+    """The visibility rule: subject not hidden, or observer became aware of them since they hid.
+    Compared by event id, not clock time: many events can share a tick."""
     if observer_id == subject["id"] or not subject["hidden"]:
         return True
-    return knows(conn, observer_id, subject["id"], "aware_of", since=subject["hidden_since"])
+    return knows(conn, observer_id, subject["id"], "aware_of", since_event=subject["hidden_event"])
 
 
 def attempts(conn, actor_id, verb, target_id, since):
@@ -110,9 +112,20 @@ def trade(conn, tid):
     return q1(conn, "SELECT * FROM trades WHERE id=?", tid)
 
 
+SEEN_OFFER = ("EXISTS (SELECT 1 FROM events e JOIN perceptions p ON p.event_id = e.id WHERE e.verb='offer' "
+              "AND json_extract(e.data, '$.trade') = trades.id AND p.observer_id = ? AND p.detected = 1)")
+
+
 def latest_trade(conn, to_id, from_id=None):
-    return q1(conn, "SELECT * FROM trades WHERE to_id=? AND status='pending' AND (? IS NULL OR from_id=?) "
-                    "ORDER BY id DESC LIMIT 1", to_id, from_id, from_id)
+    """Latest pending offer to `to_id` that they actually perceived being made."""
+    return q1(conn, f"SELECT * FROM trades WHERE to_id=? AND status='pending' AND (? IS NULL OR from_id=?) "
+                    f"AND {SEEN_OFFER} ORDER BY id DESC LIMIT 1", to_id, from_id, from_id, to_id)
+
+
+def knows_trade(conn, tid, cid):
+    """A party knows of a trade: the offerer always, the recipient only if they perceived the offer."""
+    return q1(conn, f"SELECT id FROM trades WHERE id=? AND (from_id=? OR (to_id=? AND {SEEN_OFFER}))",
+              tid, cid, cid, cid) is not None
 
 
 def next_event_id(conn):
@@ -127,6 +140,26 @@ def event(conn, eid):
 def detectors(conn, eid):
     return [r[0] for r in conn.execute(
         "SELECT observer_id FROM perceptions WHERE event_id=? AND detected=1 ORDER BY observer_id", (eid,))]
+
+
+def encounter_of(conn, cid):
+    """The active encounter this character is a member of (and hasn't left), or None."""
+    return q1(conn, "SELECT e.* FROM encounters e JOIN encounter_members m ON m.encounter_id = e.id "
+                    "WHERE m.character_id=? AND m.left_round IS NULL AND e.ended IS NULL ORDER BY e.id LIMIT 1", cid)
+
+
+def encounter(conn, eid):
+    return q1(conn, "SELECT * FROM encounters WHERE id=?", eid)
+
+
+def members(conn, eid):
+    """Active members in turn order: earlier joiners first, then initiative (high first), then id."""
+    return q(conn, "SELECT * FROM encounter_members WHERE encounter_id=? AND left_round IS NULL "
+                   "ORDER BY joined_round, initiative DESC, character_id", eid)
+
+
+def active_encounters(conn):
+    return q(conn, "SELECT * FROM encounters WHERE ended IS NULL ORDER BY id")
 
 
 # ---------------------------------------------------------------- whitelist (the only writes in the engine)
@@ -159,6 +192,13 @@ def load_fixture(conn, fx, seed):
 
 def log_input(conn, kind, actor_id, payload):
     _w(conn, "INSERT INTO inputs (kind, actor_id, payload) VALUES (?, ?, ?)", kind, actor_id, payload)
+
+
+def log_model_call(conn, actor_id, purpose, usage, verbs):
+    _w(conn, "INSERT INTO model_calls (time, actor_id, purpose, model, input_tokens, output_tokens, "
+             "cache_read_input_tokens, latency_ms, verbs) VALUES (?,?,?,?,?,?,?,?,?)",
+       now(conn), actor_id, purpose, usage.get("model", "?"), usage.get("input_tokens"), usage.get("output_tokens"),
+       usage.get("cache_read_input_tokens"), usage.get("latency_ms"), verbs)
 
 
 def advance_clock(conn, ticks):
@@ -208,9 +248,9 @@ def move_char(conn, cid, loc):
     _w(conn, "UPDATE characters SET location_id=? WHERE id=?", loc, cid)
 
 
-def set_hidden(conn, cid, hidden, since=None, total=None):
-    _w(conn, "UPDATE characters SET hidden=?, hidden_since=?, stealth_total=? WHERE id=?",
-       int(hidden), since if hidden else None, total if hidden else None, cid)
+def set_hidden(conn, cid, hidden, since_event=None, total=None):
+    _w(conn, "UPDATE characters SET hidden=?, hidden_event=?, stealth_total=? WHERE id=?",
+       int(hidden), since_event if hidden else None, total if hidden else None, cid)
 
 
 def set_hp(conn, cid, hp):
@@ -253,6 +293,27 @@ def add_trace(conn, eid, kind, item_id, location_id, detail):
 def add_knowledge(conn, observer_id, subject_id, fact, location_id, time, eid):
     _w(conn, "INSERT INTO knowledge (observer_id, subject_id, fact, location_id, time, event_id) "
              "VALUES (?,?,?,?,?,?)", observer_id, subject_id, fact, location_id, time, eid)
+
+
+def add_encounter(conn, location_id, time):
+    return _w(conn, "INSERT INTO encounters (location_id, started) VALUES (?, ?)", location_id, time).lastrowid
+
+
+def add_member(conn, eid, cid, initiative, roll_id, joined_round):
+    _w(conn, "INSERT OR REPLACE INTO encounter_members (encounter_id, character_id, initiative, roll_id, joined_round) "
+             "VALUES (?,?,?,?,?)", eid, cid, initiative, roll_id, joined_round)
+
+
+def leave_encounter(conn, eid, cid, round_):
+    _w(conn, "UPDATE encounter_members SET left_round=? WHERE encounter_id=? AND character_id=?", round_, eid, cid)
+
+
+def set_turn(conn, eid, round_, turn_id):
+    _w(conn, "UPDATE encounters SET round=?, turn_id=? WHERE id=?", round_, turn_id, eid)
+
+
+def end_encounter(conn, eid, time):
+    _w(conn, "UPDATE encounters SET ended=?, turn_id=NULL WHERE id=?", time, eid)
 
 
 def add_trade(conn, from_id, to_id, give_items, give_coins, want_items, want_coins, time):

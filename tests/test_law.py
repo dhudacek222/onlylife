@@ -111,3 +111,30 @@ def test_permadeath_leaves_items_on_the_body():
     assert one(eng, "player", "take watch from bob").outcome == "success"
     assert val(eng, "SELECT kind FROM provenance WHERE item_id='watch' ORDER BY id DESC") == "looted"
     assert one(eng, "player", "attack bob").reason == "Bob is dead."
+
+
+def test_forcing_a_door_is_heard_on_both_sides(eng):
+    place(eng, "player", "street")
+    place(eng, "tom", "tom_house")
+    setstat(eng, "player", str=40)
+    r = one(eng, "player", "force oak door")
+    assert "CRASH" in r.messages["tom"] and "CRASH" in r.messages["guard"]
+
+
+def test_repeat_pressure_on_locks(eng):
+    place(eng, "player", "street")
+    eng.submit("player", "take lockpick")
+    setskill(eng, "player", lockpicking=-30, athletics=-30)
+    assert [one(eng, "player", "unlock oak door").rolls[0].dc for _ in range(2)] == [12, 14]
+    assert [one(eng, "player", "force oak door").rolls[0].dc for _ in range(2)] == [16, 18]
+
+
+def test_stealing_from_an_afk_target_has_advantage(eng):
+    setchar(eng, "bob", status="afk")
+    assert one(eng, "player", "steal from bob").rolls[0].mode == "advantage"
+
+
+def test_name_inside_another_word_is_not_an_introduction(eng):
+    # regression: "cash" contains "Ash" and used to reveal the speaker's identity
+    one(eng, "player", "say I need cash")
+    assert val(eng, "SELECT COUNT(*) FROM knowledge WHERE subject_id='player' AND fact='knows_identity'") == 0

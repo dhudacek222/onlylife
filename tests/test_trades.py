@@ -58,7 +58,7 @@ def test_double_accept(offered):
 def test_accept_by_wrong_party(offered):
     eng = offered
     r = one(eng, "wren", "accept 1")
-    assert r.outcome == "impossible" and "isn't addressed to you" in r.reason
+    assert r.outcome == "impossible" and r.reason == "There is no such offer."  # bystanders learn nothing
     assert one(eng, "player", "accept 1").outcome == "impossible"  # can't accept your own offer
     assert one(eng, "wren", "accept").outcome == "impossible"  # nothing addressed to wren
     assert holder(eng, "knife") == ("player", None) and val(eng, "SELECT status FROM trades") == "pending"
@@ -90,3 +90,12 @@ def test_decline(offered):
     assert r.outcome == "success" and val(eng, "SELECT status FROM trades") == "declined"
     assert one(eng, "bob", "accept 1").outcome == "impossible"
     assert one(eng, "bob", "decline").reason == "There is no such offer."
+
+
+def test_decline_needs_the_other_party_here(offered):
+    # regression (review): a remote decline broadcast the offerer's name to strangers on the street
+    eng = offered
+    place(eng, "bob", "street")
+    r = one(eng, "bob", "decline")
+    assert r.outcome == "impossible" and "not here" in r.reason
+    assert val(eng, "SELECT status FROM trades WHERE id=1") == "pending"

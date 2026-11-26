@@ -127,3 +127,95 @@ def test_sneaking_into_a_room_rolls_against_the_people_there(eng):
 def test_heavy_armor_gives_stealth_disadvantage(eng):
     eng.conn.execute("UPDATE items SET location_id=NULL, holder_id='player' WHERE id='plate'")
     assert one(eng, "player", "sneak").rolls[0].mode == "disadvantage"
+
+
+def test_rehiding_in_the_same_tick_invalidates_old_awareness():
+    # regression: visibility compared clock time, so awareness from an earlier hide in the same tick leaked
+    eng = new(chain_actions_cost_separate_turns=False)
+    setskill(eng, "bob", perception=60)
+    setskill(eng, "player", stealth=40)
+    eng.submit("player", "hide and unhide")  # bob notices, same tick
+    setskill(eng, "bob", perception=-60)
+    eng.conn.execute("UPDATE meta SET value = CAST(value AS INT) - 1 WHERE key='clock'")  # force the same tick
+    eng.submit("player", "hide")
+    assert "player" not in [c["id"] for c in eng.view("bob")["characters"]]
+
+
+def test_stealth_modifiers_night_and_guards(eng):
+    place(eng, "player", "tom_house")  # unlit, nobody inside: dex +2, stealth 2, cover 2, crowd 0
+    noon = one(eng, "player", "sneak").rolls[0].modifier
+    eng.submit("player", "unhide")
+    eng.advance(9 * 60)  # 21:00
+    night = one(eng, "player", "sneak").rolls[0].modifier
+    assert (noon, night) == (6, 8)
+
+    eng2 = new()
+    place(eng2, "player", "street")  # lit; cover 1, crowd 1; gareth the guard stands here
+    watched = one(eng2, "player", "sneak").rolls[0].modifier
+    eng2.submit("player", "unhide")
+    place(eng2, "guard", "guard_post")
+    alone = one(eng2, "player", "sneak").rolls[0].modifier
+    assert (watched, alone) == (4, 6)
+
+
+def test_arrival_notices_hidden_people_by_passive_perception(eng):
+    setskill(eng, "wren", stealth=-40)
+    eng.submit("wren", "hide")
+    place(eng, "player", "street")
+    assert one(eng, "player", "go to tavern").outcome == "success"  # passive 13 beats wren's total
+    assert "wren" in [c["id"] for c in eng.view("player")["characters"]]
+    seen = rows(eng, "SELECT subject_id FROM knowledge WHERE observer_id='player' AND fact='seen_at' ORDER BY subject_id")
+    assert ("bob",) in seen  # the arriver notes everyone visible
+
+
+def test_offline_characters_perceive_nothing(eng):
+    setchar(eng, "bob", status="offline")
+    r = one(eng, "player", "take knife")
+    assert "bob" not in r.messages
+    assert rows(eng, "SELECT * FROM perceptions WHERE event_id=? AND observer_id='bob'", r.event_id) == []
+
+
+def _ash_spots_hidden_wren(eng):
+    setskill(eng, "wren", stealth=30)
+    eng.submit("wren", "hide")
+    setskill(eng, "player", perception=40, sleight=40)
+    eng.submit("player", "look")  # ash notices wren; bob does not
+    assert "wren" not in [c["id"] for c in eng.view("bob")["characters"]]
+
+
+def test_witnesses_never_learn_who_a_hidden_target_is(eng):
+    # regression (review): witnesses saw "... says to Wren" although Wren was hidden from them
+    _ash_spots_hidden_wren(eng)
+    setchar(eng, "wren", hp=100, max_hp=100)
+    setskill(eng, "player", athletics=40)
+    eng.submit("player", "take knife")
+    for cmd in ("talk to wren: psst", "attack wren", "steal from wren"):
+        r = one(eng, "player", cmd)
+        assert "Wren" not in r.messages["bob"] and "grey cloak" not in r.messages["bob"], (cmd, r.messages["bob"])
+        assert "someone" in r.messages["bob"]
+
+
+def test_a_hidden_offerer_cannot_be_traded_with_blind(eng):
+    # regression (review): bare "accept" completed a trade with a hidden offerer and named her
+    eng.submit("wren", "offer 5 coins to bob")
+    setskill(eng, "wren", stealth=40)
+    eng.submit("wren", "hide")
+    r = one(eng, "bob", "accept")
+    assert r.outcome == "failure" and "not here" in r.reason
+    assert val(eng, "SELECT coins FROM characters WHERE id='bob'") == 20
+
+
+def test_an_offer_nobody_perceived_does_not_exist_for_its_recipient(eng):
+    setskill(eng, "wren", stealth=40)
+    eng.submit("wren", "hide")
+    eng.submit("wren", "offer 5 coins to bob")  # made from hiding: bob never perceives it
+    for cmd in ("accept", "accept 1", "decline"):
+        assert one(eng, "bob", cmd).reason == "There is no such offer.", cmd
+
+
+def test_reasons_do_not_name_strangers(eng):
+    setchar(eng, "wren", status="dead")
+    eng.conn.execute("INSERT INTO characters (id, name, is_npc, location_id, status, hp, max_hp, stats, face_shape) "
+                     "VALUES ('vex', 'Vex', 1, 'tavern', 'dead', 0, 10, '{}', 'sharp')")
+    r = one(eng, "player", "attack vex")  # the player may type a guessed name; the reason must not confirm more
+    assert r.reason == "The stranger is dead."

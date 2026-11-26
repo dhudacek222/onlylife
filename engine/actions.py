@@ -1,5 +1,5 @@
 """Action schema: verb metadata and the Action / Roll / Result records."""
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from typing import NamedTuple
 
 
@@ -31,6 +31,56 @@ class Action:
     want_coins: int = 0
     raw: str = ""
 
+    def to_dict(self):
+        return {k: v for k, v in asdict(self).items() if v not in (None, 0, "")}
+
+    @classmethod
+    def from_dict(cls, d):
+        """Strict: unknown verbs or fields raise ValueError (AI output is untrusted input)."""
+        names = {f.name for f in fields(cls)}
+        if set(d) - names:
+            raise ValueError(f"unknown action fields: {sorted(set(d) - names)}")
+        if d.get("verb") not in VERBS:
+            raise ValueError(f"unknown verb: {d.get('verb')!r}")
+        a = cls(**d)
+        for f in ("target", "item", "text", "want_item", "raw"):
+            v = getattr(a, f)
+            if v is not None and not isinstance(v, str):
+                raise ValueError(f"{f} must be a string")
+        for f in ("coins", "want_coins"):
+            v = getattr(a, f)
+            if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+                raise ValueError(f"{f} must be a non-negative integer")
+        return a
+
+
+def to_command(a):
+    """Canonical text the hardcoded parser maps back to exactly this action (used for buttons)."""
+    t, i = a.target or "", a.item or ""
+    if a.verb in ("say",):
+        return f'say "{a.text}"'
+    if a.verb == "talk":
+        return f"talk to {t}: {a.text}"
+    if a.verb in ("move", "flee"):
+        return f"{'go to' if a.verb == 'move' else 'flee to'} {t}"
+    if a.verb in ("take", "drop", "use"):
+        return f"{a.verb} {i}"
+    if a.verb == "give":
+        return f"give {i} to {t}"
+    if a.verb == "buy":
+        return f"buy {i}" + (f" from {t}" if t else "")
+    if a.verb == "attack":
+        return f"attack {t}" + (f" with {i}" if i else "")
+    if a.verb == "steal":
+        return f"steal {i} from {t}" if i else f"steal from {t}"
+    if a.verb == "offer":
+        give = i or f"{a.coins} coins"
+        want = a.want_item or (f"{a.want_coins} coins" if a.want_coins else "")
+        return f"offer {give} to {t}" + (f" for {want}" if want else "")
+    if a.verb in ("open", "close", "unlock", "lock", "force", "accept", "decline"):
+        return f"{a.verb} {t}".strip()
+    return a.verb  # look, sneak, unhide, wait
+
 
 @dataclass
 class Roll:
@@ -53,10 +103,11 @@ class Roll:
 @dataclass
 class Result:
     action: Action
-    outcome: str  # success | failure | impossible | ambiguous | unparsed | skipped
+    outcome: str  # success | failure | impossible | ambiguous | unparsed | skipped | refused | confirm | clarify
     reason: str = ""
     missing: list = field(default_factory=list)
     candidates: list = field(default_factory=list)
     rolls: list = field(default_factory=list)
     event_id: int | None = None
     messages: dict = field(default_factory=dict)
+    alternatives: list = field(default_factory=list)  # buttons: [{"label": str, "command": str, "confirm"?: bool}]
