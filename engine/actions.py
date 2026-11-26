@@ -36,8 +36,22 @@ class Action:
 
     @classmethod
     def from_dict(cls, d):
+        """Strict: unknown verbs or fields raise ValueError (AI output is untrusted input)."""
         names = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in d.items() if k in names})
+        if set(d) - names:
+            raise ValueError(f"unknown action fields: {sorted(set(d) - names)}")
+        if d.get("verb") not in VERBS:
+            raise ValueError(f"unknown verb: {d.get('verb')!r}")
+        a = cls(**d)
+        for f in ("target", "item", "text", "want_item", "raw"):
+            v = getattr(a, f)
+            if v is not None and not isinstance(v, str):
+                raise ValueError(f"{f} must be a string")
+        for f in ("coins", "want_coins"):
+            v = getattr(a, f)
+            if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+                raise ValueError(f"{f} must be a non-negative integer")
+        return a
 
 
 def to_command(a):

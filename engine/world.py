@@ -79,17 +79,19 @@ def door_sides(conn, did):
     return [r[0] for r in conn.execute("SELECT from_id FROM connections WHERE door_id=? ORDER BY from_id", (did,))]
 
 
-def knows(conn, observer_id, subject_id, fact, since=None):
+def knows(conn, observer_id, subject_id, fact, since_event=None):
     return conn.execute(
-        "SELECT 1 FROM knowledge WHERE observer_id=? AND subject_id=? AND fact=? AND (? IS NULL OR time>=?) LIMIT 1",
-        (observer_id, subject_id, fact, since, since)).fetchone() is not None
+        "SELECT 1 FROM knowledge WHERE observer_id=? AND subject_id=? AND fact=? "
+        "AND (? IS NULL OR event_id>=?) LIMIT 1",
+        (observer_id, subject_id, fact, since_event, since_event)).fetchone() is not None
 
 
 def can_see(conn, observer_id, subject):
-    """The visibility rule: subject not hidden, or observer became aware of them since they hid."""
+    """The visibility rule: subject not hidden, or observer became aware of them since they hid.
+    Compared by event id, not clock time: many events can share a tick."""
     if observer_id == subject["id"] or not subject["hidden"]:
         return True
-    return knows(conn, observer_id, subject["id"], "aware_of", since=subject["hidden_since"])
+    return knows(conn, observer_id, subject["id"], "aware_of", since_event=subject["hidden_event"])
 
 
 def attempts(conn, actor_id, verb, target_id, since):
@@ -110,9 +112,20 @@ def trade(conn, tid):
     return q1(conn, "SELECT * FROM trades WHERE id=?", tid)
 
 
+SEEN_OFFER = ("EXISTS (SELECT 1 FROM events e JOIN perceptions p ON p.event_id = e.id WHERE e.verb='offer' "
+              "AND json_extract(e.data, '$.trade') = trades.id AND p.observer_id = ? AND p.detected = 1)")
+
+
 def latest_trade(conn, to_id, from_id=None):
-    return q1(conn, "SELECT * FROM trades WHERE to_id=? AND status='pending' AND (? IS NULL OR from_id=?) "
-                    "ORDER BY id DESC LIMIT 1", to_id, from_id, from_id)
+    """Latest pending offer to `to_id` that they actually perceived being made."""
+    return q1(conn, f"SELECT * FROM trades WHERE to_id=? AND status='pending' AND (? IS NULL OR from_id=?) "
+                    f"AND {SEEN_OFFER} ORDER BY id DESC LIMIT 1", to_id, from_id, from_id, to_id)
+
+
+def knows_trade(conn, tid, cid):
+    """A party knows of a trade: the offerer always, the recipient only if they perceived the offer."""
+    return q1(conn, f"SELECT id FROM trades WHERE id=? AND (from_id=? OR (to_id=? AND {SEEN_OFFER}))",
+              tid, cid, cid, cid) is not None
 
 
 def next_event_id(conn):
@@ -235,9 +248,9 @@ def move_char(conn, cid, loc):
     _w(conn, "UPDATE characters SET location_id=? WHERE id=?", loc, cid)
 
 
-def set_hidden(conn, cid, hidden, since=None, total=None):
-    _w(conn, "UPDATE characters SET hidden=?, hidden_since=?, stealth_total=? WHERE id=?",
-       int(hidden), since if hidden else None, total if hidden else None, cid)
+def set_hidden(conn, cid, hidden, since_event=None, total=None):
+    _w(conn, "UPDATE characters SET hidden=?, hidden_event=?, stealth_total=? WHERE id=?",
+       int(hidden), since_event if hidden else None, total if hidden else None, cid)
 
 
 def set_hp(conn, cid, hp):

@@ -35,6 +35,9 @@ harness/       AI seams (M2). May import engine.actions / engine.parser / engine
   claude.py      ClaudeDecisionModel, ClaudeNarrator, EscalatingModel; validate() for untrusted model output
   narration.py   TemplateNarrator (the M1 templates, now fed per-observer facts)
   eval.py        parser eval: accuracy per category + calibration; evalset.jsonl (139 cases)
+  scene.py       scene_for() (view with opaque character refs c1, c2…), unref(), VERB_GUIDE — for outside AIs
+engine/connector.py  the game as tools for a player's own AI assistant (look / act), stdlib only
+engine/mcp_server.py thin MCP 2.x wrapper around connector.Game (the only module importing `mcp`)
 tests/
 ```
 
@@ -87,7 +90,7 @@ JSON columns are `TEXT` holding JSON. All ids are TEXT slugs (`"bob"`, `"knife_1
 - `connections(from_id, to_id, door_id NULL, PK(from_id,to_id))` — store both directions; both rows share the door.
 - `housing_tiers(tier PK, windows INT, doors INT, lock_dc INT, cellar INT)`
 - `buildings(location_id PK, tier → housing_tiers, owner_id, cosmetic TEXT, wealth_display INT 1-5, image_ref NULL)` — mechanics come from the tier, cosmetics are text only.
-- `characters(id PK, name, is_npc, role TEXT NULL ['guard','merchant',…], location_id, status ['online','afk','offline','dead'], hp, max_hp, xp, coins INT CHECK ≥0, stats JSON {str,dex,con,int,wis,cha} as scores, skills JSON {stealth,perception,sleight,athletics,lockpicking,…} ints, skill_points, face_shape TEXT (immutable trigger), appearance JSON {hair,clothes,…}, wanted_level INT, hidden INT, hidden_since INT NULL, stealth_total INT NULL)`
+- `characters(id PK, name, is_npc, role TEXT NULL ['guard','merchant',…], location_id, status ['online','afk','offline','dead'], hp, max_hp, xp, coins INT CHECK ≥0, stats JSON {str,dex,con,int,wis,cha} as scores, skills JSON {stealth,perception,sleight,athletics,lockpicking,…} ints, skill_points, face_shape TEXT (immutable trigger), appearance JSON {hair,clothes,…}, wanted_level INT, hidden INT, hidden_event INT NULL, stealth_total INT NULL)`
 - `reputation(character_id, scope, value, PK(character_id,scope))`
 - `items(id PK, type, name, aliases JSON, properties JSON, price INT NULL, location_id NULL, holder_id NULL, flags JSON)` — CHECK exactly one of `location_id`,`holder_id` non-null. **DELETE forbidden by trigger.**
 - `provenance(id PK AUTOINC, item_id, kind ['created','bought','sold','gifted','given','dropped','taken','stolen','looted','traded','transformed'], from_id NULL, to_id NULL, location_id, time, event_id NULL)` — append-only (UPDATE/DELETE forbidden).
@@ -95,7 +98,7 @@ JSON columns are `TEXT` holding JSON. All ids are TEXT slugs (`"bob"`, `"knife_1
 - `perceptions(event_id, observer_id, detected INT, recognized INT, appearance_seen JSON NULL, roll_id NULL, PK(event_id,observer_id))` — witness records for every event; append-only.
 - `traces(id PK AUTOINC, event_id, kind ['bloodied_item','item_left','forced_lock','purchase','body'], item_id NULL, location_id, detail JSON)` — physical evidence; append-only.
 - `VIEW evidence` = events with `crime IS NOT NULL` joined to perceptions + traces.
-- `knowledge(id PK AUTOINC, observer_id, subject_id, fact ['aware_of','seen_at','knows_identity','knows_crime'], location_id NULL, time, event_id NULL)` — append-only. Visibility rule: observer sees subject iff `subject.hidden=0` OR an `aware_of` row exists with `time >= subject.hidden_since`.
+- `knowledge(id PK AUTOINC, observer_id, subject_id, fact ['aware_of','seen_at','knows_identity','knows_crime'], location_id NULL, time, event_id NULL)` — append-only. Visibility rule: observer sees subject iff `subject.hidden=0` OR an `aware_of` row exists with `event_id >= subject.hidden_event` (the sneak event). Compared by event id, not clock time, because many events can share a tick (chained actions with `chain_actions_cost_separate_turns=False`; concurrent players at M5).
 - `dice_log(id PK = roll counter, time, event_id NULL, actor_id, purpose, sides, raw JSON (both dice if adv/dis), mode ['normal','advantage','disadvantage'], modifier, total, dc NULL, success NULL)` — append-only.
 - `trades(id PK AUTOINC, from_id, to_id, give_items JSON, give_coins, want_items JSON, want_coins, status ['pending','accepted','declined','failed'], created, resolved NULL)`
 - `inputs(id PK AUTOINC, kind ['cmd','advance'], actor_id NULL, payload TEXT)` — everything needed for replay. Since M2 a `cmd` payload is JSON `{"text", "actions"}` (the decided actions).
@@ -122,12 +125,12 @@ Verbs (all resolve against the actor's current location):
 | offer / accept / decline | items held / coins available, both here | trivial | `trades` row; **accept re-validates everything and swaps atomically** or marks `failed` |
 | attack(target, weapon?) | target visible, here, alive; weapon held if named (else best held weapon; none → unarmed) | d20+str mod (+athletics) − unarmed penalty vs AC; advantage if actor hidden and target not aware, or target afk; hp damage = weapon die + str mod (min 1) | ends actor hidden; weapon flag `bloodied` + trace; hp→0: status dead, `murder`, trace `body`, death_mode applied; else `assault` |
 | steal(item or coins, target) | target here, visible, alive; item held by target | d20+dex+sleight vs target passive perception + repeat penalty; advantage if target afk | success: transfer (provenance `stolen`) or half target's coins; target detects only if roll fails; crime `theft` |
-| sneak | not already hidden | stealth = d20+dex+stealth+cover+crowd+(2 if night and not lit) −2 per visible guard; disadvantage with heavy armor | `hidden=1`, `hidden_since=now`, `stealth_total`; each observer whose passive perception ≥ total gets `aware_of` |
+| sneak | not already hidden | stealth = d20+dex+stealth+cover+crowd+(2 if night and not lit) −2 per visible guard; disadvantage with heavy armor | `hidden=1`, `hidden_event=<this event>`, `stealth_total`; each observer whose passive perception ≥ total gets `aware_of` |
 | unhide | hidden | — | `hidden=0` |
 | open/close(door) | door here; open requires unlocked | trivial | door state |
 | unlock/lock(door) | key item held → trivial; unlock w/o key needs a held `lockpick` item → dex+lockpicking vs lock_dc; no key and no lockpick → **impossible** (missing prerequisite listed) | | door state |
 | force(door) | door here, locked | str+athletics vs lock_dc+4 | unlocked+open; trace `forced_lock`; **noisy: everyone in both connected locations detects** |
-| talk(target, text) / say(text) | target visible+here | none | event; listeners get `knows_identity` if actor introduces (`text` contains their own name) |
+| talk(target, text) / say(text) | target visible+here | none | event; listeners get `knows_identity` if actor introduces (`text` contains their own name as a whole word) |
 | use(item) | held, has `properties.on_use` | trivial | apply effect (`heal`), item transforms per `on_use.becomes` (provenance `transformed`) — never deleted |
 | flee(dest) | connected | dex check vs dc_normal | success = move; failure = stay |
 | wait | — | — | event only |
@@ -153,6 +156,7 @@ results = eng.submit("player", "take knife and attack bob")   # -> [Result(outco
 results = eng.submit("player", "take knife and attack bob", confirm=True)   # executes
 eng.advance(60)                     # moves global clock, logged in inputs
 eng.view("player")                  # dict: what this observer can see right now
+eng.submit_actions("player", [Action("take", item="knife")])   # structured input (connector / harness): confirm flow, then execute
 eng2 = Engine.replay(fixture, seed, config, eng.inputs())   # identical events + dice_log
 ```
 `Result(action, outcome ['success','failure','impossible','ambiguous','unparsed','skipped','refused','confirm','clarify'], reason, missing, candidates, rolls: list[Roll], event_id, messages: dict[observer_id, str], alternatives: list[{label, command, confirm?}])` — `rolls` + `reason` make every failure legible (brief §2.9).
@@ -240,3 +244,22 @@ truncated response is treated as not understood.
 - `Config.encounters` (default True) is switched off only by the M1 single-action rule tests.
 - Not yet: free attack on a failed flee (BRIEF says "may"), guards joining fights they witness (needs NPC routines),
   per-turn real-time timer (server, step 5).
+
+## 12. Player-subscription play: the game as an MCP connector (`connector.py`, `mcp_server.py`)
+
+Players bring their own Claude / ChatGPT subscription; we pay for no model calls. Subscription credentials cannot
+legally be used by our code (Anthropic forbids third-party use of Free/Pro/Max OAuth), so the direction is inverted:
+the player's app calls **our** tools. The player's assistant is both DecisionModel and Narrator.
+
+- Tools: `look()` → `{scene, perceived}`; `act(actions, confirm=false)` → `{status: done|needs_confirmation|invalid,
+  outcomes, you_perceive, earlier, scene}`. Server `instructions` = engine-is-truth rules + `VERB_GUIDE`.
+- Same guarantees as §9: the assistant only ever receives its player's scene and its player's engine lines; actions
+  are re-validated by `Action.from_dict` and go through `Engine.submit_actions`, so irreversible verbs return
+  `needs_confirmation` with the engine's own risk estimate (worded with labels the player knows, never ids); the
+  assistant must ask the human before resending with `confirm=true`. Encounters' turn gate applies as for anyone.
+  It can mis-narrate to its own player, never change the world beyond the whitelist.
+- Refs are **stable per player** (`c1`, `c2`… assigned on first sight), because someone may arrive between look and act.
+- Lines other players perceive go to an in-memory per-player inbox, delivered on their next look/act.
+- `Game` serializes all engine access with a lock (single authoritative writer); the SQLite connection allows
+  cross-thread use for that reason. `Engine.open(path)` continues a persistent world.
+- ponytail: one player per process, no auth. M5: MCP OAuth → token → character id, one server for all players.

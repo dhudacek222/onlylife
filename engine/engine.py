@@ -33,6 +33,11 @@ class Engine:
         return eng
 
     @classmethod
+    def open(cls, path, config=None, model=None, narrator=None):
+        """Continue an existing world file (the persistent world; create() starts a new one)."""
+        return cls(db.connect(path), config, model, narrator)
+
+    @classmethod
     def replay(cls, fixture, seed, config, inputs):
         """Re-executes the logged DECIDED actions: no model is consulted, so replay is exact."""
         eng = cls.create(seed=seed, config=config, world=fixture)
@@ -80,13 +85,24 @@ class Engine:
             msg = f"Did you mean: {command}?"
             return [Result(d.actions[0], "clarify", msg, messages={actor_id: msg},
                            alternatives=[{"label": command, "command": command}, CANCEL])]
-        if risky and self.config.confirm_irreversible and not confirm:
-            stop = self._preview(actor_id, d.actions)
-            if stop.outcome != "confirm":
-                return [stop]
-            stop.alternatives = [{"label": f"Yes: {command}", "command": command, "confirm": True}, CANCEL]
+        return self.submit_actions(actor_id, d.actions, confirm, text, template=via == "button")
+
+    def submit_actions(self, actor_id, actions, confirm=False, text="", template=True):
+        """Structured actions already decided (by our decision model, or by a player's own AI through the
+        connector): confirm irreversible ones with a risk estimate, then execute. Never trusts them further."""
+        if not actions:
+            raise ValueError("no actions")
+        if self.config.confirm_irreversible and not confirm and any(VERBS[a.verb].irreversible for a in actions):
+            stop = self._preview(actor_id, actions)
+            if stop.outcome == "confirm":
+                command = " and ".join(to_command(a) for a in actions)
+                stop.alternatives = [{"label": f"Yes: {command}", "command": command, "confirm": True}, CANCEL]
             return [stop]
-        return self._execute(actor_id, text, d.actions, template=via == "button") + self._npc_turns()
+        return self._execute(actor_id, text, actions, template) + self._npc_turns()
+
+    def is_player(self, cid):
+        ch = W.char(self.conn, cid)
+        return ch is not None and not ch["is_npc"]
 
     def timeout(self, encounter_id):
         """The server calls this when the turn timer (Config.turn_timer_seconds) runs out: the member whose turn it
@@ -127,7 +143,7 @@ class Engine:
                 if r.outcome in ("impossible", "ambiguous"):
                     return self._stopped(actor_id, a, r)
                 if r.outcome != "success":  # a dice-dependent step: we can't promise what comes after it
-                    msg = f"First you'd {to_command(a)}; what follows depends on how that goes. Go ahead?"
+                    msg = f"First you'd {self._spoken(actor_id, a)}; what follows depends on how that goes. Go ahead?"
                     return Result(a, "confirm", msg, messages={actor_id: msg})
         finally:
             self.conn.execute("ROLLBACK")
@@ -138,13 +154,20 @@ class Engine:
         res.alternatives = self._alternatives(actor_id, action, res)
         return res
 
+    def _spoken(self, actor_id, action):
+        """The action as the actor would say it: a character target by the label they know, never its id."""
+        if action.target and W.char(self.conn, action.target):
+            label = self._label(actor_id, action.target)
+            action = Action(**{**action.__dict__, "target": "the stranger" if label.startswith("a stranger") else label})
+        return to_command(action)
+
     def _risk(self, actor_id, action, probe):
         """Verbal risk estimate (OPEN DECISION 1): precision grows with the character's experience."""
         crime = VERBS[action.verb].crime
         tail = f" It is a crime ({crime}) if anyone sees it." if crime else " This can't be undone."
         mode = self.config.risk_display
         if not isinstance(probe, rules.Probe) or mode == "none":
-            return f"Are you sure you want to {to_command(action)}?{tail}"
+            return f"Are you sure you want to {self._spoken(actor_id, action)}?{tail}"
         p = float(success_probability(probe.modifier, probe.dc, probe.mode))
         xp = W.char(self.conn, actor_id)["xp"]
         coarse, fine = self.config.risk_xp_steps
@@ -155,7 +178,7 @@ class Engine:
                                       (0.85, "likely"), (1.01, "almost certain")) if p < t)
         else:
             est = "poor" if p < 0.35 else "even" if p < 0.7 else "good"
-        return f"{to_command(action).capitalize()}? Your odds look {est}.{tail}"
+        return f"{self._spoken(actor_id, action).capitalize()}? Your odds look {est}.{tail}"
 
     def _alternatives(self, actor_id, action, res):
         """Feasible next steps instead of a bare 'no' (BRIEF §5.4). Built from the actor's view only."""
@@ -228,6 +251,8 @@ class Engine:
         if ch is None:
             d = W.door(self.conn, subject_id)
             return f"the {d['name']}" if d else W.location(self.conn, subject_id)["name"]
+        if not W.can_see(self.conn, observer_id, ch):  # e.g. the hidden target of a witnessed act
+            return "someone"
         if W.knows(self.conn, observer_id, subject_id, "knows_identity"):
             return ch["name"]
         return "a stranger in " + ch["appearance"].get("clothes", "plain clothes")

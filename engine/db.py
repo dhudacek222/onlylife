@@ -33,7 +33,7 @@ CREATE TABLE characters(
   coins INT NOT NULL DEFAULT 0 CHECK (coins >= 0),
   stats TEXT NOT NULL, skills TEXT NOT NULL DEFAULT '{}', skill_points INT NOT NULL DEFAULT 0,
   face_shape TEXT NOT NULL, appearance TEXT NOT NULL DEFAULT '{}', wanted_level INT NOT NULL DEFAULT 0,
-  hidden INT NOT NULL DEFAULT 0, hidden_since INT, stealth_total INT);
+  hidden INT NOT NULL DEFAULT 0, hidden_event INT, stealth_total INT);
 
 CREATE TABLE reputation(
   character_id TEXT REFERENCES characters, scope TEXT, value INT NOT NULL DEFAULT 0,
@@ -129,8 +129,9 @@ SCHEMA += "".join(
 
 
 def connect(path=":memory:"):
-    """Autocommit connection (isolation_level=None): callers open transactions explicitly."""
-    conn = sqlite3.connect(path, isolation_level=None)
+    """Autocommit connection (isolation_level=None): callers open transactions explicitly.
+    check_same_thread=False: servers call from worker threads; they serialize access (connector.Game.lock)."""
+    conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
